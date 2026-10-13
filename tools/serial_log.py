@@ -39,7 +39,7 @@ def main():
         if not line:
             continue
         print(line, flush=True)
-        # the app's line, printed once MicroLink reports CONNECTED
+        # the app's line, printed once TailTiny reports CONNECTED
         m = re.search(r'Connected! VPN IP: (100\.\d+\.\d+\.\d+)', line)
         if m and not vpn_ip:
             vpn_ip = m.group(1)

@@ -1,4 +1,4 @@
-# MicroLink v2 Cellular Connect — ESP32-S3
+# TailTiny Cellular Connect — ESP32-S3
 # Board selection: change via menuconfig (Waveshare SIM7600X or LILYGO T-SIM7670G-S3)
 # Target
 CONFIG_IDF_TARGET="esp32s3"
@@ -54,7 +54,7 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # UART — ensure console UART doesn't conflict with modem UART
 CONFIG_ESP_CONSOLE_UART_NUM=0
 
-# MicroLink — enable cellular modem (board selected via menuconfig)
+# TailTiny — enable cellular modem (board selected via menuconfig)
 CONFIG_ML_ENABLE_CELLULAR=y
 
 # Cellular APN (REQUIRED for PPP — without this, IPCP gets no response)

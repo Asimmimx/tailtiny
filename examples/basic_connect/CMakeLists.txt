@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Add microlink-v2 component path
+# Add tailtiny component path
 set(EXTRA_COMPONENT_DIRS
     "../../components"
 )
@@ -12,4 +12,4 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.credentials")
 endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(microlink_v2_basic_connect)
+project(tailtiny_basic_connect)

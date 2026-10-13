@@ -1,6 +1,6 @@
 # Large Tailnet Considerations
 
-MicroLink v2 has been tested with 1000+ peer tailnets. This document covers configuration and limits.
+TailTiny has been tested with 1000+ peer tailnets. This document covers configuration and limits.
 
 ## Configuration
 
@@ -9,7 +9,7 @@ MicroLink v2 has been tested with 1000+ peer tailnets. This document covers conf
 Controls max simultaneous WireGuard peers with active tunnels.
 
 ```
-idf.py menuconfig → MicroLink V2 → Maximum simultaneous WireGuard peers
+idf.py menuconfig → TailTiny → Maximum simultaneous WireGuard peers
 ```
 
 | Setting | Memory | Use case |
@@ -25,7 +25,7 @@ idf.py menuconfig → MicroLink V2 → Maximum simultaneous WireGuard peers
 Controls NVS flash cache for peer metadata (persists across reboots).
 
 ```
-idf.py menuconfig → MicroLink V2 → Maximum cached peers in NVS
+idf.py menuconfig → TailTiny → Maximum cached peers in NVS
 ```
 
 | Setting | NVS Blob Size | Partition Requirement |
@@ -48,13 +48,13 @@ factory,  app,  factory, ,        0x300000,
 Large peer lists require larger HTTP/2 response buffers:
 
 ```
-idf.py menuconfig → MicroLink V2 → Coord buffer size (KB)
+idf.py menuconfig → TailTiny → Coord buffer size (KB)
 ```
 
 - Default: 64KB (sufficient for ~200 peers)
 - Large tailnets: 512KB (PSRAM-backed)
 
-Already configured in `microlink_internal.h`:
+Already configured in `tailtiny_internal.h`:
 - H2 WINDOW_UPDATE: proactive updates for responses >64KB
 - Recv timeout: 60s (control plane may be slow with large peer lists)
 
@@ -68,7 +68,7 @@ With 100+ peers, DISCO probe intervals are staggered to prevent network flooding
 
 ## Delta Updates
 
-MicroLink v2 supports Tailscale's incremental peer updates:
+TailTiny supports Tailscale's incremental peer updates:
 - `PeersChanged`: Only changed peers sent
 - `PeersRemoved`: Only removed peer IDs sent
 - `PeersChangedPatch`: Minimal field-level patches
@@ -80,5 +80,5 @@ This means a 1000-peer tailnet doesn't re-download the full peer list on every l
 1. **Set `max_peers` to actual need** — not the tailnet size. If your ESP32 only talks to 1 server, set `max_peers=4`.
 2. **Use PSRAM** — Required for large tailnets. All ESP32-S3 boards we support have 8MB PSRAM.
 3. **Use reusable auth keys** — Large deployments should use pre-generated reusable keys.
-4. **IMEI-based naming** — For cellular deployments, `microlink_imei_device_name()` generates unique names.
+4. **IMEI-based naming** — For cellular deployments, `tailtiny_imei_device_name()` generates unique names.
 5. **NVS partition** — For 1024+ cached peers, use a custom partition table.

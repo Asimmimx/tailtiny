@@ -1,11 +1,11 @@
 # Tailscale Native Client Reference
 
-Key architecture patterns from tailscaled that MicroLink v2 should replicate.
+Key architecture patterns from tailscaled that TailTiny should replicate.
 Reference source: `../../tailscale-reference/tailscale/`
 
 ## Reference File Map
 
-| MicroLink v2 Module | Tailscale Go Reference |
+| TailTiny Module | Tailscale Go Reference |
 |---------------------|----------------------|
 | ml_coord.c | `control/controlclient/auto.go`, `control/controlclient/direct.go`, `control/controlclient/map.go` |
 | ml_derp.c | `derp/derp_client.go`, `derp/derphttp/derphttp_client.go`, `wgengine/magicsock/derp.go` |

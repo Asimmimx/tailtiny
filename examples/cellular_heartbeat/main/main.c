@@ -2,13 +2,13 @@
  * @file main.c
  * @brief Cellular Heartbeat — Bidirectional UDP over 4G Tailscale VPN
  *
- * Demonstrates MicroLink as the transport layer for a periodic heartbeat
+ * Demonstrates TailTiny as the transport layer for a periodic heartbeat
  * system over 4G cellular. The transport (4G cellular → Tailscale VPN →
  * encrypted UDP) is fully functional with bidirectional communication.
  * The message protocol uses a simplified binary format — replace it with
  * your application-specific serialization.
  *
- * What MicroLink provides (transport):
+ * What TailTiny provides (transport):
  *   - 4G cellular connectivity via SIM7600/SIM7670 (PPP or AT socket bridge)
  *   - Tailscale VPN with WireGuard encryption
  *   - NAT traversal (STUN + DERP relay fallback)
@@ -48,8 +48,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 
-#include "microlink.h"
-#include "microlink_internal.h"
+#include "tailtiny.h"
+#include "tailtiny_internal.h"
 #include "ml_cellular.h"
 #include "ml_config_httpd.h"
 
@@ -69,8 +69,8 @@ static const char *TAG = "cell_hb";
  * Heartbeat Protocol (Placeholder)
  *
  * Simplified binary message format for transport testing. Replace with your
- * application-specific serialization. The MicroLink UDP API used here
- * (microlink_udp_send/recv) stays the same regardless of what message
+ * application-specific serialization. The TailTiny UDP API used here
+ * (tailtiny_udp_send/recv) stays the same regardless of what message
  * format you serialize into the payload.
  * ========================================================================== */
 
@@ -152,7 +152,7 @@ static void robot_allow_operation(void) {
  * These demonstrate the integration pattern:
  *   - hb_on_recv() is called with raw UDP payload bytes
  *   - hb_update() is called every loop iteration
- *   - microlink_udp_send/recv handle the transport
+ *   - tailtiny_udp_send/recv handle the transport
  *
  * Your implementation would deserialize your application messages from the
  * UDP payload, validate checksums, and manage state.
@@ -176,7 +176,7 @@ static void hb_on_recv(uint32_t src_ip, uint16_t src_port,
     /* Remember operator station */
     if (!hb_ctx.operator_known || hb_ctx.operator_ip != src_ip) {
         char ip_str[16];
-        microlink_ip_to_str(src_ip, ip_str);
+        tailtiny_ip_to_str(src_ip, ip_str);
         ESP_LOGI(TAG, "Operator station: %s:%u", ip_str, src_port);
     }
     hb_ctx.operator_ip = src_ip;
@@ -247,7 +247,7 @@ static void hb_on_recv(uint32_t src_ip, uint16_t src_port,
     }
 
     char ip_str[16];
-    microlink_ip_to_str(src_ip, ip_str);
+    tailtiny_ip_to_str(src_ip, ip_str);
     ESP_LOGI(TAG, "[RECV] ← %s:%u \"%s\" (%u bytes)", ip_str, src_port, msg_str, (unsigned)len);
 }
 
@@ -255,7 +255,7 @@ static void hb_on_recv(uint32_t src_ip, uint16_t src_port,
  * Periodic update — sends heartbeats and checks timeouts.
  * Called every main loop iteration (~20ms).
  */
-static void hb_update(microlink_udp_socket_t *sock, uint64_t now_ms) {
+static void hb_update(tailtiny_udp_socket_t *sock, uint64_t now_ms) {
     /* --- Check heartbeat timeout --- */
     if (hb_ctx.state == HB_STATE_ACTIVE && hb_ctx.operator_known) {
         if (now_ms - hb_ctx.last_hb_recv_ms > HB_TIMEOUT_MS) {
@@ -280,7 +280,7 @@ static void hb_update(microlink_udp_socket_t *sock, uint64_t now_ms) {
         .checksum = 0,  /* Stub — add CRC-16 in production */
     };
 
-    esp_err_t err = microlink_udp_send(sock, hb_ctx.operator_ip, HB_PORT,
+    esp_err_t err = tailtiny_udp_send(sock, hb_ctx.operator_ip, HB_PORT,
                                         &hb, sizeof(hb));
     if (err == ESP_OK) {
         hb_ctx.hb_send_count++;
@@ -396,23 +396,23 @@ void app_main(void) {
                                            : "AT socket bridge");
 
     /* ================================================================
-     * Step 3: Initialize MicroLink (Tailscale)
+     * Step 3: Initialize TailTiny (Tailscale)
      * ================================================================ */
 
-    ESP_LOGI(TAG, "=== Step 3: Starting MicroLink (Tailscale) over 4G ===");
+    ESP_LOGI(TAG, "=== Step 3: Starting TailTiny (Tailscale) over 4G ===");
 
-    const char *device_name = microlink_imei_device_name();
+    const char *device_name = tailtiny_imei_device_name();
     if (!device_name || device_name[0] == '\0') {
         const char *kconfig_name = CONFIG_ML_DEVICE_NAME;
         if (kconfig_name && kconfig_name[0]) {
             device_name = kconfig_name;
         } else {
-            device_name = microlink_default_device_name();
+            device_name = tailtiny_default_device_name();
         }
     }
     ESP_LOGI(TAG, "Device name: %s", device_name);
 
-    microlink_config_t config = {
+    tailtiny_config_t config = {
         .auth_key = TAILSCALE_AUTH_KEY,
         .device_name = device_name,
         .enable_derp = true,
@@ -421,22 +421,22 @@ void app_main(void) {
         .max_peers = CONFIG_ML_MAX_PEERS,
     };
 
-    microlink_t *ml = microlink_init(&config);
+    tailtiny_t *ml = tailtiny_init(&config);
     if (!ml) {
-        ESP_LOGE(TAG, "Failed to initialize MicroLink");
+        ESP_LOGE(TAG, "Failed to initialize TailTiny");
         return;
     }
 
-    ESP_ERROR_CHECK(microlink_start(ml));
+    ESP_ERROR_CHECK(tailtiny_start(ml));
 
     ESP_LOGI(TAG, "Waiting for Tailscale connection...");
-    while (!microlink_is_connected(ml)) {
+    while (!tailtiny_is_connected(ml)) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    uint32_t vpn_ip = microlink_get_vpn_ip(ml);
+    uint32_t vpn_ip = tailtiny_get_vpn_ip(ml);
     char ip_buf[16];
-    microlink_ip_to_str(vpn_ip, ip_buf);
+    tailtiny_ip_to_str(vpn_ip, ip_buf);
 
     printf("\n");
     printf("================================================================\n");
@@ -450,7 +450,7 @@ void app_main(void) {
      * Step 4: Create UDP socket for heartbeat protocol
      * ================================================================ */
 
-    microlink_udp_socket_t *sock = microlink_udp_create(ml, HB_PORT);
+    tailtiny_udp_socket_t *sock = tailtiny_udp_create(ml, HB_PORT);
     if (!sock) {
         ESP_LOGE(TAG, "Failed to create UDP socket on port %d", HB_PORT);
         return;
@@ -466,7 +466,7 @@ void app_main(void) {
     /* Pre-configure operator IP if set via Kconfig */
     const char *op_ip_str = CONFIG_ML_EXAMPLE_OPERATOR_PEER_IP;
     if (op_ip_str && op_ip_str[0] != '\0') {
-        hb_ctx.operator_ip = microlink_parse_ip(op_ip_str);
+        hb_ctx.operator_ip = tailtiny_parse_ip(op_ip_str);
         if (hb_ctx.operator_ip != 0) {
             hb_ctx.operator_known = true;
             hb_ctx.operator_port = HB_PORT;
@@ -504,7 +504,7 @@ void app_main(void) {
         uint32_t src_ip;
         uint16_t src_port;
 
-        esp_err_t err = microlink_udp_recv(sock, &src_ip, &src_port,
+        esp_err_t err = tailtiny_udp_recv(sock, &src_ip, &src_port,
                                             recv_buf, &recv_len, 0);
         if (err == ESP_OK && recv_len > 0) {
             hb_on_recv(src_ip, src_port, recv_buf, recv_len, now_ms);
@@ -542,7 +542,7 @@ void app_main(void) {
             }
 
             if (send_response) {
-                microlink_udp_send(sock, src_ip, src_port, response, strlen(response));
+                tailtiny_udp_send(sock, src_ip, src_port, response, strlen(response));
             }
         }
 
@@ -560,7 +560,7 @@ void app_main(void) {
             last_status_ms = now_ms;
 
             ml_cellular_get_info(&cell_info);
-            int peer_count = microlink_is_connected(ml) ? microlink_get_peer_count(ml) : 0;
+            int peer_count = tailtiny_is_connected(ml) ? tailtiny_get_peer_count(ml) : 0;
 
             ESP_LOGI(TAG, "[STATUS] state=%s | signal=%ddBm | peers=%d | "
                      "hb_rx=%lu hb_tx=%lu timeout=%lu | heap=%lu",

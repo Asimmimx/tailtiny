@@ -1,5 +1,23 @@
 # Changelog
 
+## v3.0.0 (2026-10-13)
+
+MicroLink is now **TailTiny**. Only the name changed; the code does the same as v2.3.1.
+
+### Updating an existing project
+
+| Before | After |
+|---|---|
+| `components/microlink/` | `components/tailtiny/` |
+| `REQUIRES microlink` | `REQUIRES tailtiny` |
+| `#include "microlink.h"` | `#include "tailtiny.h"` |
+| `#include "microlink_internal.h"` | `#include "tailtiny_internal.h"` |
+| `microlink_*` functions and types (`microlink_init()`, `microlink_t`, ...) | `tailtiny_*` (`tailtiny_init()`, `tailtiny_t`, ...) |
+| menuconfig: "MicroLink V2 Configuration" | "TailTiny Configuration" |
+| github.com/Asimmimx/microlink | github.com/Asimmimx/tailtiny (the old link redirects) |
+
+Unchanged: the `CONFIG_ML_*` options and `ml_*` names, so `sdkconfig` and `sdkconfig.credentials` files keep working. The keys are still stored in the NVS namespace `"microlink"`, so a device updated from v2.x keeps its Tailscale identity and doesn't need a new auth key.
+
 ## v2.3.1 (2026-10-09)
 
 A RAM re-measurement for the ESP32-C2 entry of the compatibility chart. It found two low-RAM problems, fixed here, and a wrong number in v2.2.0.

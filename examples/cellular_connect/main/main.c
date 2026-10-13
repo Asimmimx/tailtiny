@@ -1,14 +1,14 @@
 /**
  * @file main.c
- * @brief MicroLink v2 Cellular Connect Example
+ * @brief TailTiny Cellular Connect Example
  *
  * Connects to Tailscale over 4G cellular using SIM7600 module.
  * No WiFi required — all traffic goes through the AT socket bridge,
  * which uses the SIM7600's internal TCP/IP stack (AT+NETOPEN/CIPOPEN).
  *
  * Supports two transport modes (menuconfig → Cellular Connect Example):
- *   UDP: Fire-and-forget messages via microlink_udp_send()
- *   TCP: Reliable connections via microlink_tcp_connect/send()
+ *   UDP: Fire-and-forget messages via tailtiny_udp_send()
+ *   TCP: Reliable connections via tailtiny_tcp_connect/send()
  *
  * Hardware:
  *   Seeed Studio XIAO ESP32S3 + Waveshare SIM7600X 4G Module
@@ -19,7 +19,7 @@
  * Flow:
  *   1. Initialize SIM7600 modem (AT commands, SIM check, network registration)
  *   2. Connect cellular data (PPP primary, AT socket bridge fallback)
- *   3. Initialize MicroLink (Tailscale) over cellular
+ *   3. Initialize TailTiny (Tailscale) over cellular
  *   4. Send/receive messages over the VPN tunnel (UDP or TCP)
  */
 
@@ -33,8 +33,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 
-#include "microlink.h"
-#include "microlink_internal.h"
+#include "tailtiny.h"
+#include "tailtiny_internal.h"
 #include "ml_cellular.h"
 #include "ml_config_httpd.h"
 
@@ -44,14 +44,14 @@ static const char *TAG = "cell_main";
 #define MSG_PORT             9000
 #define MSG_SEND_INTERVAL_MS 5000
 
-/* MicroLink handle */
-static microlink_t *ml = NULL;
+/* TailTiny handle */
+static tailtiny_t *ml = NULL;
 
 /* UDP socket (used in UDP mode) */
-static microlink_udp_socket_t *udp_sock = NULL;
+static tailtiny_udp_socket_t *udp_sock = NULL;
 
 /* TCP socket (used in TCP mode) */
-static microlink_tcp_socket_t *tcp_sock = NULL;
+static tailtiny_tcp_socket_t *tcp_sock = NULL;
 
 /* Message counters */
 static uint32_t msg_tx_count = 0;
@@ -61,11 +61,11 @@ static uint32_t msg_rx_count = 0;
  * UDP RX Callback
  * ========================================================================== */
 
-static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t src_port,
+static void on_udp_rx(tailtiny_udp_socket_t *sock, uint32_t src_ip, uint16_t src_port,
                        const uint8_t *data, size_t len, void *user_data) {
     msg_rx_count++;
     char ip_str[16];
-    microlink_ip_to_str(src_ip, ip_str);
+    tailtiny_ip_to_str(src_ip, ip_str);
 
     char msg[256];
     size_t copy_len = (len < sizeof(msg) - 1) ? len : sizeof(msg) - 1;
@@ -80,7 +80,7 @@ static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t sr
     char reply[300];
     int reply_len = snprintf(reply, sizeof(reply), "ECHO(4G): %s", msg);
     if (reply_len > 0) {
-        esp_err_t err = microlink_udp_send(sock, src_ip, src_port, reply, reply_len);
+        esp_err_t err = tailtiny_udp_send(sock, src_ip, src_port, reply, reply_len);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "UDP TX echo -> %s:%u", ip_str, src_port);
         }
@@ -91,27 +91,27 @@ static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t sr
  * Callbacks
  * ========================================================================== */
 
-static void on_state_change(microlink_t *ml_handle, microlink_state_t state, void *user_data) {
+static void on_state_change(tailtiny_t *ml_handle, tailtiny_state_t state, void *user_data) {
     const char *state_names[] = {
         "IDLE", "WIFI_WAIT", "CONNECTING", "REGISTERING",
         "CONNECTED", "RECONNECTING", "ERROR"
     };
     const char *name = (state < sizeof(state_names)/sizeof(state_names[0]))
                        ? state_names[state] : "UNKNOWN";
-    ESP_LOGI(TAG, "MicroLink state: %s", name);
+    ESP_LOGI(TAG, "TailTiny state: %s", name);
 
     if (state == ML_STATE_CONNECTED) {
-        uint32_t ip = microlink_get_vpn_ip(ml_handle);
+        uint32_t ip = tailtiny_get_vpn_ip(ml_handle);
         char ip_str[16];
-        microlink_ip_to_str(ip, ip_str);
+        tailtiny_ip_to_str(ip, ip_str);
         ESP_LOGI(TAG, "Connected! VPN IP: %s (via 4G cellular)", ip_str);
     }
 }
 
-static void on_peer_update(microlink_t *ml_handle, const microlink_peer_info_t *peer,
+static void on_peer_update(tailtiny_t *ml_handle, const tailtiny_peer_info_t *peer,
                              void *user_data) {
     char ip_str[16];
-    microlink_ip_to_str(peer->vpn_ip, ip_str);
+    tailtiny_ip_to_str(peer->vpn_ip, ip_str);
     ESP_LOGI(TAG, "Peer: %s (%s) online=%d direct=%d",
              peer->hostname, ip_str, peer->online, peer->direct_path);
 }
@@ -126,20 +126,20 @@ static void tcp_send_task(void *arg) {
     uint16_t tcp_port = CONFIG_ML_EXAMPLE_TCP_PORT;
 
     char ip_str[16];
-    microlink_ip_to_str(target_ip, ip_str);
+    tailtiny_ip_to_str(target_ip, ip_str);
 
     ESP_LOGI(TAG, "TCP task started: target=%s:%u", ip_str, tcp_port);
 
     while (1) {
         /* Connect if not connected */
-        if (!tcp_sock || !microlink_tcp_is_connected(tcp_sock)) {
+        if (!tcp_sock || !tailtiny_tcp_is_connected(tcp_sock)) {
             if (tcp_sock) {
-                microlink_tcp_close(tcp_sock);
+                tailtiny_tcp_close(tcp_sock);
                 tcp_sock = NULL;
             }
 
             ESP_LOGI(TAG, "TCP: Connecting to %s:%u...", ip_str, tcp_port);
-            tcp_sock = microlink_tcp_connect(ml, target_ip, tcp_port, 15000);
+            tcp_sock = tailtiny_tcp_connect(ml, target_ip, tcp_port, 15000);
             if (!tcp_sock) {
                 ESP_LOGW(TAG, "TCP: Connection failed, retrying in 10s");
                 vTaskDelay(pdMS_TO_TICKS(10000));
@@ -155,14 +155,14 @@ static void tcp_send_task(void *arg) {
             "hello from ESP32-4G #%lu (TCP)\r\n",
             (unsigned long)msg_tx_count);
 
-        esp_err_t err = microlink_tcp_send(tcp_sock, msg, msg_len);
+        esp_err_t err = tailtiny_tcp_send(tcp_sock, msg, msg_len);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "TCP TX #%lu -> %s:%u [%d bytes]",
                      (unsigned long)msg_tx_count, ip_str, tcp_port, msg_len);
 
             /* Try to read a response (non-blocking, 2s timeout) */
             char rx_buf[512];
-            int rx_len = microlink_tcp_recv(tcp_sock, rx_buf, sizeof(rx_buf) - 1, 2000);
+            int rx_len = tailtiny_tcp_recv(tcp_sock, rx_buf, sizeof(rx_buf) - 1, 2000);
             if (rx_len > 0) {
                 rx_buf[rx_len] = '\0';
                 msg_rx_count++;
@@ -171,7 +171,7 @@ static void tcp_send_task(void *arg) {
             }
         } else {
             ESP_LOGW(TAG, "TCP TX failed, reconnecting...");
-            microlink_tcp_close(tcp_sock);
+            tailtiny_tcp_close(tcp_sock);
             tcp_sock = NULL;
         }
 
@@ -199,7 +199,7 @@ void app_main(void) {
 
     printf("\n");
     printf("================================================================\n");
-    printf("  MicroLink v2 — Cellular Connect (SIM7600 4G)\n");
+    printf("  TailTiny — Cellular Connect (SIM7600 4G)\n");
     printf("  PPP primary, AT socket bridge fallback\n");
 #ifdef CONFIG_ML_EXAMPLE_TCP
     printf("  Transport: TCP (port %d)\n", CONFIG_ML_EXAMPLE_TCP_PORT);
@@ -283,10 +283,10 @@ void app_main(void) {
                                            : "AT socket bridge");
 
     /* ================================================================
-     * Step 3: Initialize MicroLink (Tailscale)
+     * Step 3: Initialize TailTiny (Tailscale)
      * ================================================================ */
 
-    ESP_LOGI(TAG, "=== Step 3: Starting MicroLink (Tailscale) over 4G ===");
+    ESP_LOGI(TAG, "=== Step 3: Starting TailTiny (Tailscale) over 4G ===");
 
     /* Use Kconfig device name, fall back to MAC-based default.
      * Using MAC (not IMEI) keeps the same Tailscale node identity
@@ -296,11 +296,11 @@ void app_main(void) {
     if (kconfig_name && kconfig_name[0]) {
         device_name = kconfig_name;
     } else {
-        device_name = microlink_default_device_name();
+        device_name = tailtiny_default_device_name();
     }
     ESP_LOGI(TAG, "Device name: %s", device_name);
 
-    microlink_config_t config = {
+    tailtiny_config_t config = {
         .auth_key = TAILSCALE_AUTH_KEY,
         .device_name = device_name,
         .enable_derp = true,
@@ -309,20 +309,20 @@ void app_main(void) {
         .max_peers = CONFIG_ML_MAX_PEERS,
     };
 
-    ml = microlink_init(&config);
+    ml = tailtiny_init(&config);
     if (!ml) {
-        ESP_LOGE(TAG, "Failed to initialize MicroLink");
+        ESP_LOGE(TAG, "Failed to initialize TailTiny");
         return;
     }
 
-    microlink_set_state_callback(ml, on_state_change, NULL);
-    microlink_set_peer_callback(ml, on_peer_update, NULL);
+    tailtiny_set_state_callback(ml, on_state_change, NULL);
+    tailtiny_set_peer_callback(ml, on_peer_update, NULL);
 
-    ESP_ERROR_CHECK(microlink_start(ml));
+    ESP_ERROR_CHECK(tailtiny_start(ml));
 
     /* Wait for CONNECTED state */
     ESP_LOGI(TAG, "Waiting for Tailscale connection...");
-    while (!microlink_is_connected(ml)) {
+    while (!tailtiny_is_connected(ml)) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
@@ -334,14 +334,14 @@ void app_main(void) {
     uint32_t target_ip = 0;
     const char *target_ip_str = CONFIG_ML_EXAMPLE_TARGET_PEER_IP;
     if (target_ip_str && target_ip_str[0] != '\0') {
-        target_ip = microlink_parse_ip(target_ip_str);
+        target_ip = tailtiny_parse_ip(target_ip_str);
     }
 
 #ifdef CONFIG_ML_EXAMPLE_TCP
     /* TCP mode — always create UDP socket too for tunnel wake-up */
-    udp_sock = microlink_udp_create(ml, MSG_PORT);
+    udp_sock = tailtiny_udp_create(ml, MSG_PORT);
     if (udp_sock) {
-        microlink_udp_set_rx_callback(udp_sock, on_udp_rx, NULL);
+        tailtiny_udp_set_rx_callback(udp_sock, on_udp_rx, NULL);
         ESP_LOGI(TAG, "UDP socket listening on port %d (for incoming)", MSG_PORT);
     }
 
@@ -354,12 +354,12 @@ void app_main(void) {
     }
 #else
     /* UDP mode */
-    udp_sock = microlink_udp_create(ml, MSG_PORT);
+    udp_sock = tailtiny_udp_create(ml, MSG_PORT);
     if (!udp_sock) {
         ESP_LOGE(TAG, "Failed to create UDP socket");
     } else {
         ESP_LOGI(TAG, "UDP socket listening on port %d", MSG_PORT);
-        microlink_udp_set_rx_callback(udp_sock, on_udp_rx, NULL);
+        tailtiny_udp_set_rx_callback(udp_sock, on_udp_rx, NULL);
     }
 
     if (target_ip != 0) {
@@ -390,7 +390,7 @@ void app_main(void) {
             char msg[128];
             int msg_len = snprintf(msg, sizeof(msg), "hello from ESP32-4G #%lu",
                                    (unsigned long)msg_tx_count);
-            esp_err_t err = microlink_udp_send(udp_sock, target_ip, MSG_PORT, msg, msg_len);
+            esp_err_t err = tailtiny_udp_send(udp_sock, target_ip, MSG_PORT, msg, msg_len);
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "UDP TX #%lu -> %s:%d", (unsigned long)msg_tx_count,
                          target_ip_str, MSG_PORT);
@@ -408,8 +408,8 @@ void app_main(void) {
             ml_cellular_info_t info;
             ml_cellular_get_info(&info);
 
-            if (microlink_is_connected(ml)) {
-                int peer_count = microlink_get_peer_count(ml);
+            if (tailtiny_is_connected(ml)) {
+                int peer_count = tailtiny_get_peer_count(ml);
                 ESP_LOGI(TAG, "Status: CONNECTED(4G/%s) | Signal: %d dBm | Peers: %d | TX: %lu | RX: %lu | Heap: %lu",
 #ifdef CONFIG_ML_EXAMPLE_TCP
                          "TCP",
@@ -421,10 +421,10 @@ void app_main(void) {
                          (unsigned long)esp_get_free_heap_size());
 
                 for (int i = 0; i < peer_count; i++) {
-                    microlink_peer_info_t pinfo;
-                    if (microlink_get_peer_info(ml, i, &pinfo) == ESP_OK) {
+                    tailtiny_peer_info_t pinfo;
+                    if (tailtiny_get_peer_info(ml, i, &pinfo) == ESP_OK) {
                         char ip_str[16];
-                        microlink_ip_to_str(pinfo.vpn_ip, ip_str);
+                        tailtiny_ip_to_str(pinfo.vpn_ip, ip_str);
                         ESP_LOGI(TAG, "  [%d] %s (%s) %s",
                                  i, pinfo.hostname, ip_str,
                                  pinfo.direct_path ? "DIRECT" : "DERP");

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Add microlink-v2 component path
+# Add tailtiny component path
 set(EXTRA_COMPONENT_DIRS
     "../../components"
 )

@@ -1,4 +1,4 @@
-# MicroLink: Full Reference
+# TailTiny: Full Reference
 
 > Detailed reference (features, memory, API, configuration, cellular, troubleshooting). For setup, start with the [README](../README.md).
 
@@ -77,7 +77,7 @@ Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G ce
 
 ### Should Work (Untested)
 
-MicroLink uses standard ESP-IDF APIs — any ESP32 variant with WiFi and sufficient RAM should work. ESP32-P4, ESP32-C3, ESP32-C6, etc. Boards with PSRAM are recommended for large tailnets (100+ peers).
+TailTiny uses standard ESP-IDF APIs — any ESP32 variant with WiFi and sufficient RAM should work. ESP32-P4, ESP32-C3, ESP32-C6, etc. Boards with PSRAM are recommended for large tailnets (100+ peers).
 
 ## Quick Start
 
@@ -130,7 +130,7 @@ CONFIG_ML_MAX_PEERS=8
 
 ## Architecture
 
-MicroLink v2 uses a fully async, task-based architecture. All protocol operations run concurrently in dedicated FreeRTOS tasks with queue-based IPC — no polling loop needed.
+TailTiny uses a fully async, task-based architecture. All protocol operations run concurrently in dedicated FreeRTOS tasks with queue-based IPC — no polling loop needed.
 
 ```
 ┌─────────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐
@@ -150,7 +150,7 @@ MicroLink v2 uses a fully async, task-based architecture. All protocol operation
 ```
 
 **Key differences from v1:**
-- No `microlink_update()` polling — all tasks run independently
+- No `tailtiny_update()` polling — all tasks run independently
 - Queue-based IPC instead of shared state + mutexes (no deadlocks)
 - Dedicated DERP TX task (non-blocking sends)
 - `select()` loop in net_io for multiplexed packet routing
@@ -170,7 +170,7 @@ MicroLink v2 uses a fully async, task-based architecture. All protocol operation
 
 ```c
 // Get a default configuration
-microlink_config_t config = {
+tailtiny_config_t config = {
     .auth_key = "tskey-auth-...",
     .device_name = "my-sensor",
     .enable_derp = true,
@@ -180,23 +180,23 @@ microlink_config_t config = {
 };
 
 // Initialize (creates tasks, does NOT connect yet)
-microlink_t *ml = microlink_init(&config);
+tailtiny_t *ml = tailtiny_init(&config);
 
 // Start connecting (WiFi must be up)
-microlink_start(ml);
+tailtiny_start(ml);
 ```
 
 ### Connection Status
 
 ```c
 // Check connection state
-microlink_state_t state = microlink_get_state(ml);
-bool connected = microlink_is_connected(ml);
+tailtiny_state_t state = tailtiny_get_state(ml);
+bool connected = tailtiny_is_connected(ml);
 
 // Get our VPN IP
-uint32_t vpn_ip = microlink_get_vpn_ip(ml);
+uint32_t vpn_ip = tailtiny_get_vpn_ip(ml);
 char ip_str[16];
-microlink_ip_to_str(vpn_ip, ip_str);
+tailtiny_ip_to_str(vpn_ip, ip_str);
 // ip_str = "100.x.y.z"
 ```
 
@@ -206,43 +206,43 @@ Connection states: `ML_STATE_IDLE` → `ML_STATE_WIFI_WAIT` → `ML_STATE_CONNEC
 
 ```c
 // Create UDP socket bound to VPN IP
-microlink_udp_socket_t *sock = microlink_udp_create(ml, 9000);
+tailtiny_udp_socket_t *sock = tailtiny_udp_create(ml, 9000);
 
 // Send to a peer
-uint32_t dest = microlink_parse_ip("100.x.y.z");
-microlink_udp_send(sock, dest, 9000, data, len);
+uint32_t dest = tailtiny_parse_ip("100.x.y.z");
+tailtiny_udp_send(sock, dest, 9000, data, len);
 
 // Blocking receive with timeout
 uint32_t src_ip;
 uint16_t src_port;
 size_t recv_len = sizeof(buffer);
-esp_err_t err = microlink_udp_recv(sock, &src_ip, &src_port, buffer, &recv_len, 5000);
+esp_err_t err = tailtiny_udp_recv(sock, &src_ip, &src_port, buffer, &recv_len, 5000);
 
 // Or use a callback for immediate handling
-microlink_udp_set_rx_callback(sock, my_rx_handler, user_data);
+tailtiny_udp_set_rx_callback(sock, my_rx_handler, user_data);
 
 // Cleanup
-microlink_udp_close(sock);
+tailtiny_udp_close(sock);
 ```
 
 ### TCP Communication
 
 ```c
 // Connect to a peer over the WG tunnel (triggers handshake if needed)
-microlink_tcp_socket_t *sock = microlink_tcp_connect(ml, "100.x.y.z", 5055);
+tailtiny_tcp_socket_t *sock = tailtiny_tcp_connect(ml, "100.x.y.z", 5055);
 
 // Send data
-microlink_tcp_send(sock, data, len);
+tailtiny_tcp_send(sock, data, len);
 
 // Blocking receive with timeout (milliseconds)
 size_t recv_len = sizeof(buffer);
-esp_err_t err = microlink_tcp_recv(sock, buffer, &recv_len, 5000);
+esp_err_t err = tailtiny_tcp_recv(sock, buffer, &recv_len, 5000);
 
 // Check connection status
-bool up = microlink_tcp_is_connected(sock);
+bool up = tailtiny_tcp_is_connected(sock);
 
 // Cleanup
-microlink_tcp_close(sock);
+tailtiny_tcp_close(sock);
 ```
 
 TCP sockets are routed through the WireGuard tunnel by binding to the VPN IP internally. The connect call will wait up to 30 seconds for the WG handshake to complete if the peer tunnel isn't already up.
@@ -251,19 +251,19 @@ TCP sockets are routed through the WireGuard tunnel by binding to the VPN IP int
 
 ```c
 // Resolve short name or FQDN to VPN IP (local lookup, no network call)
-uint32_t ip = microlink_resolve(ml, "npc1");           // short name
-uint32_t ip = microlink_resolve(ml, "npc1.tail1234.ts.net");  // FQDN
+uint32_t ip = tailtiny_resolve(ml, "npc1");           // short name
+uint32_t ip = tailtiny_resolve(ml, "npc1.tail1234.ts.net");  // FQDN
 ```
 
 ### Peer Information
 
 ```c
-int count = microlink_get_peer_count(ml);
+int count = tailtiny_get_peer_count(ml);
 for (int i = 0; i < count; i++) {
-    microlink_peer_info_t info;
-    microlink_get_peer_info(ml, i, &info);
+    tailtiny_peer_info_t info;
+    tailtiny_get_peer_info(ml, i, &info);
     char ip[16];
-    microlink_ip_to_str(info.vpn_ip, ip);
+    tailtiny_ip_to_str(info.vpn_ip, ip);
     printf("Peer: %s (%s) %s\n", info.hostname, ip,
            info.direct_path ? "direct" : "via DERP");
 }
@@ -273,19 +273,19 @@ for (int i = 0; i < count; i++) {
 
 ```c
 // State change notification
-microlink_set_state_callback(ml, on_state_change, user_data);
+tailtiny_set_state_callback(ml, on_state_change, user_data);
 
 // Peer discovered/updated
-microlink_set_peer_callback(ml, on_peer_update, user_data);
+tailtiny_set_peer_callback(ml, on_peer_update, user_data);
 
 // Raw data received (alternative to UDP socket API)
-microlink_set_data_callback(ml, on_data, user_data);
+tailtiny_set_data_callback(ml, on_data, user_data);
 ```
 
 ### Network Switching (WiFi + Cellular Failover)
 
 ```c
-// Instead of microlink_init() directly, use the net_switch module:
+// Instead of tailtiny_init() directly, use the net_switch module:
 ml_net_switch_config_t ns_config = {
     .wifi_ssid = "MyWiFi",
     .wifi_pass = "MyPassword",
@@ -295,8 +295,8 @@ ml_net_switch_config_t ns_config = {
 ml_net_switch_init(&ns_config);
 ml_net_switch_start();
 
-// Get the MicroLink handle (same API as above)
-microlink_t *ml = ml_net_switch_get_handle();
+// Get the TailTiny handle (same API as above)
+tailtiny_t *ml = ml_net_switch_get_handle();
 ```
 
 ### Network Rebind
@@ -306,28 +306,28 @@ microlink_t *ml = ml_net_switch_get_handle();
 // Preserves WG peer state, crypto keys, VPN IP, and DISCO state.
 // Closes/recreates DISCO+STUN sockets, signals coord+DERP to reconnect.
 // ~330ms rebind, ~7s VPN recovery.
-esp_err_t ret = microlink_rebind(ml);
+esp_err_t ret = tailtiny_rebind(ml);
 ```
 
-The `ml_net_switch` module calls `microlink_rebind()` automatically during WiFi↔cellular transitions.
+The `ml_net_switch` module calls `tailtiny_rebind()` automatically during WiFi↔cellular transitions.
 
 ### Cleanup
 
 ```c
-microlink_stop(ml);
-microlink_destroy(ml);
+tailtiny_stop(ml);
+tailtiny_destroy(ml);
 ```
 
 ### Factory Reset
 
 ```c
 // Erase all stored keys and cached peers (call BEFORE init)
-microlink_factory_reset();
+tailtiny_factory_reset();
 ```
 
 ## Bidirectional UDP Communication
 
-MicroLink supports full bidirectional UDP communication over the Tailscale VPN. The ESP32 can both send and receive without waiting for a peer to initiate.
+TailTiny supports full bidirectional UDP communication over the Tailscale VPN. The ESP32 can both send and receive without waiting for a peer to initiate.
 
 ### How It Works
 
@@ -357,7 +357,7 @@ nc -u -l 9000
 
 ## Cellular Performance
 
-MicroLink uses PPP for cellular data, giving real lwIP sockets instead of routing through AT commands. This enables direct UDP, STUN, and NAT hole-punching — eliminating the DERP relay hop for peers on non-symmetric NATs.
+TailTiny uses PPP for cellular data, giving real lwIP sockets instead of routing through AT commands. This enables direct UDP, STUN, and NAT hole-punching — eliminating the DERP relay hop for peers on non-symmetric NATs.
 
 ### PPP vs AT Socket Bridge
 
@@ -378,7 +378,7 @@ When PPP is active, the modem UART carries raw IP packets via the PPP protocol. 
 
 ### AT Socket Bridge Fallback
 
-If PPP authentication fails (e.g., carrier rejects CHAP/PAP), MicroLink automatically falls back to the AT socket bridge. This uses the modem's internal TCP/IP stack via AT commands (`AT+CIPOPEN`, `AT+CIPSEND`, etc.). It's slower but works with any carrier.
+If PPP authentication fails (e.g., carrier rejects CHAP/PAP), TailTiny automatically falls back to the AT socket bridge. This uses the modem's internal TCP/IP stack via AT commands (`AT+CIPOPEN`, `AT+CIPSEND`, etc.). It's slower but works with any carrier.
 
 ### Carrier Compatibility
 
@@ -424,7 +424,7 @@ Enable `CONFIG_ML_ENABLE_CONFIG_HTTPD=y` in sdkconfig.defaults to get a web UI a
 
 ## Configuration
 
-All settings via `idf.py menuconfig` → MicroLink V2 Configuration.
+All settings via `idf.py menuconfig` → TailTiny Configuration.
 
 ### Runtime Configuration
 
@@ -445,7 +445,7 @@ All settings via `idf.py menuconfig` → MicroLink V2 Configuration.
 ### Kconfig Options (`idf.py menuconfig`)
 
 ```
-MicroLink V2 Configuration
+TailTiny Configuration
 ├── Core
 │   ├── Enable zero-copy WireGuard receive    [ ]
 │   ├── Maximum simultaneous WireGuard peers  (16)
@@ -484,7 +484,7 @@ MicroLink V2 Configuration
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ML_ZERO_COPY_WG` | `n` | Zero-copy WireGuard via raw lwIP PCB (for 30fps+ streaming). See [High-Throughput Mode](#high-throughput-mode-zero-copy-wireguard). |
-| `ML_MAX_PEERS` | `16` with PSRAM, `8` without | Maximum simultaneous active WireGuard tunnels (1-64). Each uses ~200 bytes. This is NOT the tailnet size limit — MicroLink tracks all peers (300+) but only maintains active tunnels to this many at once. Reduce to 8 for non-PSRAM. |
+| `ML_MAX_PEERS` | `16` with PSRAM, `8` without | Maximum simultaneous active WireGuard tunnels (1-64). Each uses ~200 bytes. This is NOT the tailnet size limit — TailTiny tracks all peers (300+) but only maintains active tunnels to this many at once. Reduce to 8 for non-PSRAM. |
 | `ML_NVS_MAX_PEERS` | `64` | Peers cached in NVS flash (16-1024). Persists across reboots so DISCO probing starts immediately. Each entry: 92 bytes. LRU eviction when full. |
 | `ML_PRIORITY_PEER_IP` | Empty | Priority peer VPN IP (e.g., `100.x.y.z`). Guaranteed a WG slot even when peer table is full — LRU non-priority peer is evicted. Also settable via web UI. |
 | `ML_H2_BUFFER_SIZE_KB` | `512` with PSRAM, `80` without | Largest MapResponse accepted (64-2048 KB). The buffer is allocated at the response's actual size, so this is a cap, not a reservation. Rough guide: 64 KB ≈ 30 peers, 512 KB ≈ 300 peers, 2048 KB ≈ 1200 peers. |
@@ -532,7 +532,7 @@ MicroLink V2 Configuration
 
 ### DERP Relay
 
-V2 uses fully dynamic DERP discovery — no manual region configuration needed. On startup, MicroLink:
+V2 uses fully dynamic DERP discovery — no manual region configuration needed. On startup, TailTiny:
 
 1. Parses the `DERPMap` from the Tailscale MapResponse (supports up to 32 regions)
 2. Before the first DERP connect, times a TCP connect to one node in every region and picks the fastest. It only switches away from the current region if the new one is clearly faster (at least 10 ms and 20%). The choice is stored in NVS (key `derp_pref`) and reported at the next registration.
@@ -543,27 +543,27 @@ V2 uses fully dynamic DERP discovery — no manual region configuration needed. 
 
 ### Custom Coordination Server (Headscale / Ionscale)
 
-MicroLink supports custom coordination servers like [Headscale](https://github.com/juanfont/headscale) and [Ionscale](https://github.com/jsiebens/ionscale). This allows you to run your own private Tailscale-compatible control plane.
+TailTiny supports custom coordination servers like [Headscale](https://github.com/juanfont/headscale) and [Ionscale](https://github.com/jsiebens/ionscale). This allows you to run your own private Tailscale-compatible control plane.
 
 **Configuration:** Set the control plane host via the HTTP config server web UI (Device Settings → Control Plane Host) or programmatically via `ctrl_host` in the config struct.
 
-**Server key:** MicroLink automatically fetches the server's Noise public key from the `/key` endpoint via HTTPS. No manual key configuration required.
+**Server key:** TailTiny automatically fetches the server's Noise public key from the `/key` endpoint via HTTPS. No manual key configuration required.
 
 **Notes:**
 - Generate auth keys from your Headscale/Ionscale admin interface, not from Tailscale
 - If your custom server uses self-signed certificates, add them to the ESP32's certificate bundle
-- MicroLink implements ts2021 — ensure your coordination server supports this version
+- TailTiny implements ts2021 — ensure your coordination server supports this version
 - DERP discovery is automatic from the server's `DERPMap`
 
 ## High-Throughput Mode (Zero-Copy WireGuard)
 
-For applications requiring high data throughput (e.g., video streaming at 30fps+), MicroLink offers an optional zero-copy WireGuard receive mode.
+For applications requiring high data throughput (e.g., video streaming at 30fps+), TailTiny offers an optional zero-copy WireGuard receive mode.
 
 ### Configuration
 
 ```bash
 idf.py menuconfig
-# Navigate to: MicroLink V2 Configuration
+# Navigate to: TailTiny Configuration
 # Enable: "Enable zero-copy WireGuard receive (high-throughput mode)"
 ```
 
@@ -638,7 +638,7 @@ Zero-copy mode contributed by [dj-oyu](https://github.com/dj-oyu/microlink).
 ### Factory reset
 If the device is in a bad state (wrong keys cached, stale peer data):
 ```c
-microlink_factory_reset();  // Call before microlink_init()
+tailtiny_factory_reset();  // Call before tailtiny_init()
 ```
 This erases all NVS-stored keys and peer cache. The device will re-register on next boot.
 
@@ -698,7 +698,7 @@ if (now - last_heap_log > 60000) {  // Every 60 seconds
 
 ### Contributors
 
-MicroLink includes improvements from community forks:
+TailTiny includes improvements from community forks:
 
 - **[dj-oyu](https://github.com/dj-oyu)** — Zero-copy WireGuard receive mode, PONG rate-limiting, adaptive probe intervals, symmetric NAT port spray, and path discovery optimizations. Originally developed for high-throughput video streaming on RDK-X5 smart pet camera.
 

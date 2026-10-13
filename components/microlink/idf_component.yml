@@ -1,7 +1,0 @@
-version: "2.3.1"
-description: "Tailscale client for ESP32: WireGuard, DERP relay, DISCO, MagicDNS"
-url: "https://github.com/Asimmimx/microlink"
-dependencies:
-  idf: ">=5.0"
-  wireguard_lwip:
-    path: "components/wireguard_lwip"

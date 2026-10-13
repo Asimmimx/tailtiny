@@ -10,8 +10,8 @@ escapes, listed keys used as values, random whitespace, truncated input.
 import json, os, random, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, '..', '..', 'components', 'microlink', 'src', 'ml_json_strip.c')
-INC = os.path.join(HERE, '..', '..', 'components', 'microlink', 'include')
+SRC = os.path.join(HERE, '..', '..', 'components', 'tailtiny', 'src', 'ml_json_strip.c')
+INC = os.path.join(HERE, '..', '..', 'components', 'tailtiny', 'include')
 CC = os.environ.get('CC', 'gcc')
 EXE = '.exe' if os.name == 'nt' else ''
 KEYS = {"Hostinfo", "CapMap", "PacketFilter", "Drop"}   # must match strip_runner.c

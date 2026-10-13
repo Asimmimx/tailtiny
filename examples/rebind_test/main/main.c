@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief microlink_rebind() Integration Test — Full Switching
+ * @brief tailtiny_rebind() Integration Test — Full Switching
  *
  * Tests three rebind scenarios:
  *   Test 1: Same-interface rebind (PPP → PPP)
@@ -23,14 +23,14 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 
-#include "microlink.h"
-#include "microlink_internal.h"
+#include "tailtiny.h"
+#include "tailtiny_internal.h"
 #include "ml_cellular.h"
 #include "ml_config_httpd.h"
 
 static const char *TAG = "rebind_test";
 
-static microlink_t *ml = NULL;
+static tailtiny_t *ml = NULL;
 
 #define REBIND_DELAY_S     15
 #define RECOVERY_TIMEOUT_S 30
@@ -46,7 +46,7 @@ static int s_wifi_retries = 0;
 static char wifi_ssid[33] = "";
 static char wifi_pass[65] = "";
 
-static void on_state_change(microlink_t *handle, microlink_state_t state, void *user_data) {
+static void on_state_change(tailtiny_t *handle, tailtiny_state_t state, void *user_data) {
     const char *names[] = {
         "IDLE", "WIFI_WAIT", "CONNECTING", "REGISTERING",
         "CONNECTED", "RECONNECTING", "ERROR"
@@ -133,10 +133,10 @@ static bool do_rebind_test(const char *label)
     int pre_sock = ml->disco_sock4;
 
     uint64_t t0 = xTaskGetTickCount();
-    esp_err_t ret = microlink_rebind(ml);
+    esp_err_t ret = tailtiny_rebind(ml);
     uint32_t rebind_ms = (xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
 
-    ESP_LOGI(TAG, "microlink_rebind() returned %s in %lu ms",
+    ESP_LOGI(TAG, "tailtiny_rebind() returned %s in %lu ms",
              esp_err_to_name(ret), (unsigned long)rebind_ms);
 
     if (ret != ESP_OK) {
@@ -158,7 +158,7 @@ static bool do_rebind_test(const char *label)
 
     for (int i = 0; i < RECOVERY_TIMEOUT_S * 2; i++) {
         vTaskDelay(pdMS_TO_TICKS(500));
-        bool connected = microlink_is_connected(ml);
+        bool connected = tailtiny_is_connected(ml);
         if (!connected && !saw_disconnect) {
             saw_disconnect = true;
             ESP_LOGW(TAG, "  VPN disconnected (expected)");
@@ -202,7 +202,7 @@ void app_main(void) {
 
     printf("\n");
     printf("================================================================\n");
-    printf("  microlink_rebind() Full Switching Test\n");
+    printf("  tailtiny_rebind() Full Switching Test\n");
     printf("  WiFi: %s\n", has_wifi ? wifi_ssid : "(none — NVS empty, skip WiFi tests)");
     printf("================================================================\n\n");
 
@@ -246,13 +246,13 @@ void app_main(void) {
     ESP_LOGI(TAG, "Data mode: %s",
              ml_cellular_get_data_mode() == ML_DATA_MODE_PPP ? "PPP" : "AT socket");
 
-    /* Step 3: Start MicroLink */
-    ESP_LOGI(TAG, "=== Step 3: MicroLink start ===");
+    /* Step 3: Start TailTiny */
+    ESP_LOGI(TAG, "=== Step 3: TailTiny start ===");
 
-    const char *device_name = microlink_imei_device_name();
-    if (!device_name || !device_name[0]) device_name = microlink_default_device_name();
+    const char *device_name = tailtiny_imei_device_name();
+    if (!device_name || !device_name[0]) device_name = tailtiny_default_device_name();
 
-    microlink_config_t config = {
+    tailtiny_config_t config = {
         .auth_key = CONFIG_ML_TAILSCALE_AUTH_KEY,
         .device_name = device_name,
         .enable_derp = true,
@@ -261,14 +261,14 @@ void app_main(void) {
         .max_peers = CONFIG_ML_MAX_PEERS,
     };
 
-    ml = microlink_init(&config);
-    if (!ml) { ESP_LOGE(TAG, "FAIL: microlink_init"); return; }
-    microlink_set_state_callback(ml, on_state_change, NULL);
-    ESP_ERROR_CHECK(microlink_start(ml));
+    ml = tailtiny_init(&config);
+    if (!ml) { ESP_LOGE(TAG, "FAIL: tailtiny_init"); return; }
+    tailtiny_set_state_callback(ml, on_state_change, NULL);
+    ESP_ERROR_CHECK(tailtiny_start(ml));
 
     ESP_LOGI(TAG, "Waiting for CONNECTED...");
     int wait_s = 0;
-    while (!microlink_is_connected(ml)) {
+    while (!tailtiny_is_connected(ml)) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (++wait_s > 120) {
             ESP_LOGE(TAG, "FAIL: Timed out (120s)");
@@ -276,11 +276,11 @@ void app_main(void) {
         }
     }
 
-    uint32_t vpn_ip = microlink_get_vpn_ip(ml);
+    uint32_t vpn_ip = tailtiny_get_vpn_ip(ml);
     char ip_str[16];
-    microlink_ip_to_str(vpn_ip, ip_str);
+    tailtiny_ip_to_str(vpn_ip, ip_str);
     ESP_LOGI(TAG, "CONNECTED: %s (%d peers) in %ds",
-             ip_str, microlink_get_peer_count(ml), wait_s);
+             ip_str, tailtiny_get_peer_count(ml), wait_s);
 
     /* ================================================================
      * Test 1: Same-interface rebind (PPP → PPP)
@@ -371,7 +371,7 @@ results:
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
         ESP_LOGI(TAG, "Status: connected=%d peers=%d sock=%d heap=%lu",
-                 microlink_is_connected(ml), microlink_get_peer_count(ml),
+                 tailtiny_is_connected(ml), tailtiny_get_peer_count(ml),
                  ml->disco_sock4, (unsigned long)esp_get_free_heap_size());
     }
 }

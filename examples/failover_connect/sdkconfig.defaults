@@ -59,7 +59,7 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # UART
 CONFIG_ESP_CONSOLE_UART_NUM=0
 
-# MicroLink — cellular modem (board selected via menuconfig)
+# TailTiny — cellular modem (board selected via menuconfig)
 CONFIG_ML_ENABLE_CELLULAR=y
 
 # Cellular APN (REQUIRED for PPP — without this, IPCP gets no response)

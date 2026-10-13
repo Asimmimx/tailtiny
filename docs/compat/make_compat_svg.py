@@ -31,7 +31,7 @@ def esc(s):
     return html.escape(s, quote=True)
 
 parts = [f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-labelledby="t d" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
-<title id="t">MicroLink ESP32 compatibility</title>
+<title id="t">TailTiny ESP32 compatibility</title>
 <desc id="d">{esc('; '.join(f"{r['chip']}: {STATUS[r['status']][2]}. {r['note']}" for r in rows))}</desc>
 <style>
   :root {{ --surface:#fcfcfb; --ink:#1a1a19; --ink2:#5f5e5a; --rule:#e6e5e0; --chipbg:#f3f2ee; }}
@@ -52,7 +52,7 @@ parts = [f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" vi
   .icon.warning {{ fill: #1a1a19; }}
 </style>
 <rect class="bg" width="{W}" height="{H}" rx="10"/>
-<text class="title" x="{LEFT}" y="34">Which ESP32 works with MicroLink?</text>
+<text class="title" x="{LEFT}" y="34">Which ESP32 works with TailTiny?</text>
 <text class="sub" x="{LEFT}" y="54">Built with ESP-IDF v5.3.2 using the basic_connect example. Hardware testing on ESP32-C3.</text>
 <text class="hdr" x="{COL_CHIP}" y="{TOP - 8}">CHIP</text>
 <text class="hdr" x="{COL_STATUS}" y="{TOP - 8}">STATUS</text>

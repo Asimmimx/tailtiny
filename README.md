@@ -1,8 +1,8 @@
-# MicroLink: Tailscale for ESP32
+# TailTiny: Tailscale for ESP32
 
 Put an ESP32 on your [Tailscale](https://tailscale.com) network. Once it's on your tailnet, any of your devices can reach it from anywhere: phone, laptop, server. You don't need port forwarding or a public IP.
 
-> This is a maintained fork of [CamM2325/microlink](https://github.com/CamM2325/microlink), which has had no commits since March 2026.
+> TailTiny is a maintained fork of [MicroLink](https://github.com/CamM2325/microlink) (renamed in v3.0.0), which has had no commits since March 2026.
 > It adds bug fixes, plus easier setup and ESP32-C3 support. Every fix was tested on real hardware ([what changed](#what-this-fork-fixes)).
 
 ---
@@ -21,12 +21,12 @@ Put an ESP32 on your [Tailscale](https://tailscale.com) network. Once it's on yo
 | ESP32 | 🟡 Should work | Tested by the original author (no PSRAM) |
 | ESP32-C6 | 🟡 Should work | Builds. Single core like the C3, with more RAM |
 | ESP32-S2 | 🟠 Low RAM | Builds. RAM use not measured on an S2 yet; use a board with PSRAM (most S2 boards have it) |
-| ESP32-C2 | 🟠 Low RAM | Builds. MicroLink needs about 185 KB free after WiFi connects to keep reconnecting reliably (about 156 KB just to join once). A C2 has about 95 KB by default, and about 169 KB with Espressif's deepest RAM tuning on ESP-IDF 5.5 ([Espressif](https://developer.espressif.com/blog/2025/11/esp32c2-ram-optimization/)), so it is still short |
+| ESP32-C2 | 🟠 Low RAM | Builds. TailTiny needs about 185 KB free after WiFi connects to keep reconnecting reliably (about 156 KB just to join once). A C2 has about 95 KB by default, and about 169 KB with Espressif's deepest RAM tuning on ESP-IDF 5.5 ([Espressif](https://developer.espressif.com/blog/2025/11/esp32c2-ram-optimization/)), so it is still short |
 | ESP32-C5 / C61 | ❔ Unknown | WiFi support needs ESP-IDF 5.5+. Not built yet |
 | ESP32-H2 | ❌ No | No WiFi (Thread/Zigbee/BLE only) |
 | ESP32-P4 | ❌ No | No built-in WiFi |
 
-"Should work" means it builds with ESP-IDF v5.3.2 using this fork, but hasn't been run on hardware with this fork yet. The RAM numbers come from an ESP32-C3 with part of its memory held back to mimic a smaller chip ([details](CHANGELOG.md)). If you try one, please [open an issue](https://github.com/Asimmimx/microlink/issues) with the result.
+"Should work" means it builds with ESP-IDF v5.3.2 using this fork, but hasn't been run on hardware with this fork yet. The RAM numbers come from an ESP32-C3 with part of its memory held back to mimic a smaller chip ([details](CHANGELOG.md)). If you try one, please [open an issue](https://github.com/Asimmimx/tailtiny/issues) with the result.
 
 </details>
 
@@ -36,7 +36,7 @@ Put an ESP32 on your [Tailscale](https://tailscale.com) network. Once it's on yo
 
 Working with Claude Code, Codex, Cursor or Copilot? Open this repository and say:
 
-> *Set up MicroLink on my ESP32 board.*
+> *Set up TailTiny on my ESP32 board.*
 
 The assistant reads [`AGENTS.md`](AGENTS.md). It detects your chip and serial port, asks you only for your WiFi details and Tailscale key, then builds, flashes and checks the connection.
 
@@ -54,11 +54,11 @@ Follow Espressif's installer for your OS (v5.3 or newer):
 
 Run the commands below in the **ESP-IDF terminal** that the installer sets up.
 
-### 2. Download MicroLink
+### 2. Download TailTiny
 
 ```bash
-git clone https://github.com/Asimmimx/microlink.git
-cd microlink/examples/basic_connect
+git clone https://github.com/Asimmimx/tailtiny.git
+cd tailtiny/examples/basic_connect
 ```
 
 ### 3. Get a Tailscale auth key
@@ -101,7 +101,7 @@ idf.py -p COM5 flash monitor
 After about 15 seconds you should see:
 
 ```
-MicroLink state: CONNECTED
+TailTiny state: CONNECTED
 Connected! VPN IP: 100.x.y.z
 ```
 
@@ -120,29 +120,29 @@ echo "hello" | nc -u 100.x.y.z 9000      # the example echoes it back
 
 ## Use it in your own project
 
-1. Copy [`examples/basic_connect/sdkconfig.defaults`](examples/basic_connect/sdkconfig.defaults) into your project. It enables the crypto and network options MicroLink needs.
+1. Copy [`examples/basic_connect/sdkconfig.defaults`](examples/basic_connect/sdkconfig.defaults) into your project. It enables the crypto and network options TailTiny needs.
 2. Add one line to your project's top-level `CMakeLists.txt`, before `include(...project.cmake)`:
 
    ```cmake
-   set(EXTRA_COMPONENT_DIRS "path/to/microlink/components/microlink")
+   set(EXTRA_COMPONENT_DIRS "path/to/tailtiny/components/tailtiny")
    ```
 
-3. Start MicroLink once WiFi is connected:
+3. Start TailTiny once WiFi is connected:
 
    ```c
-   #include "microlink.h"
+   #include "tailtiny.h"
 
-   microlink_config_t cfg = {
+   tailtiny_config_t cfg = {
        .auth_key    = "tskey-auth-...",
        .device_name = "my-esp32",
        .enable_derp = true, .enable_stun = true, .enable_disco = true,
    };
-   microlink_t *ml = microlink_init(&cfg);
-   microlink_start(ml);
+   tailtiny_t *ml = tailtiny_init(&cfg);
+   tailtiny_start(ml);
 
-   /* once microlink_is_connected(ml) is true: */
-   microlink_udp_socket_t *sock = microlink_udp_create(ml, 9000);
-   microlink_udp_send(sock, microlink_parse_ip("100.64.0.5"), 9000, "hi", 2);
+   /* once tailtiny_is_connected(ml) is true: */
+   tailtiny_udp_socket_t *sock = tailtiny_udp_create(ml, 9000);
+   tailtiny_udp_send(sock, tailtiny_parse_ip("100.64.0.5"), 9000, "hi", 2);
    ```
 
 [`examples/basic_connect/main/main.c`](examples/basic_connect/main/main.c) is a complete, working program. The full API is in the [reference](docs/REFERENCE.md#api-reference).
@@ -151,7 +151,7 @@ echo "hello" | nc -u 100.x.y.z 9000      # the example echoes it back
 
 ## What this fork fixes
 
-Compared with upstream v2.1.0 (latest release: [v2.3.1](https://github.com/Asimmimx/microlink/releases/tag/v2.3.1)). Every item was checked on real hardware; the numbers are from an ESP32-C3 without PSRAM:
+Compared with upstream v2.1.0 (latest release: [v2.3.1](https://github.com/Asimmimx/tailtiny/releases/tag/v2.3.1)). Every item was checked on real hardware; the numbers are from an ESP32-C3 without PSRAM:
 
 - **Runs on ESP32-C3/C6 and boards without PSRAM.** Upstream reboot-looped on single-core chips and ran out of memory without PSRAM.
 - **No more crash** when a packet arrives while a socket is opening ([#17](https://github.com/CamM2325/microlink/issues/17)).
@@ -191,4 +191,4 @@ More in the [full reference](docs/REFERENCE.md#troubleshooting).
 
 ## Credits & license
 
-MicroLink was created by **Cameron Malone** ([CamM2325](https://github.com/CamM2325)). This fork keeps his work and adds fixes on top. MIT License, see [LICENSE](LICENSE).
+TailTiny is based on MicroLink, created by **Cameron Malone** ([CamM2325](https://github.com/CamM2325)). This fork keeps his work and adds fixes on top. MIT License, see [LICENSE](LICENSE).

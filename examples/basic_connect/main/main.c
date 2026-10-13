@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief MicroLink v2 Basic Connect + Messaging Example
+ * @brief TailTiny Basic Connect + Messaging Example
  *
  * Connects to a Tailscale network, then:
  * - Listens on UDP port 9000 for incoming messages (logs + echoes them back)
@@ -23,8 +23,8 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 
-#include "microlink.h"
-#include "microlink_internal.h"  /* For task handle access (diagnostic) */
+#include "tailtiny.h"
+#include "tailtiny_internal.h"  /* For task handle access (diagnostic) */
 #include "ml_config_httpd.h"     /* NVS WiFi override at boot */
 
 static const char *TAG = "main";
@@ -47,11 +47,11 @@ static int wifi_retry_count = 0;
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
-/* MicroLink handle */
-static microlink_t *ml = NULL;
+/* TailTiny handle */
+static tailtiny_t *ml = NULL;
 
 /* UDP socket */
-static microlink_udp_socket_t *udp_sock = NULL;
+static tailtiny_udp_socket_t *udp_sock = NULL;
 
 /* Message counters */
 static uint32_t msg_tx_count = 0;
@@ -61,11 +61,11 @@ static uint32_t msg_rx_count = 0;
  * UDP RX Callback (called from dedicated RX task)
  * ========================================================================== */
 
-static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t src_port,
+static void on_udp_rx(tailtiny_udp_socket_t *sock, uint32_t src_ip, uint16_t src_port,
                        const uint8_t *data, size_t len, void *user_data) {
     msg_rx_count++;
     char ip_str[16];
-    microlink_ip_to_str(src_ip, ip_str);
+    tailtiny_ip_to_str(src_ip, ip_str);
 
     /* Log the message (null-terminate for safe printing) */
     char msg[256];
@@ -85,7 +85,7 @@ static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t sr
     char reply[300];
     int reply_len = snprintf(reply, sizeof(reply), "ECHO: %s", msg);
     if (reply_len > 0) {
-        esp_err_t err = microlink_udp_send(sock, src_ip, src_port, reply, reply_len);
+        esp_err_t err = tailtiny_udp_send(sock, src_ip, src_port, reply, reply_len);
         if (err == ESP_OK) {
             ESP_LOGD(TAG, "UDP TX echo -> %s:%u", ip_str, src_port);
         } else {
@@ -98,27 +98,27 @@ static void on_udp_rx(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t sr
  * Callbacks
  * ========================================================================== */
 
-static void on_state_change(microlink_t *ml_handle, microlink_state_t state, void *user_data) {
+static void on_state_change(tailtiny_t *ml_handle, tailtiny_state_t state, void *user_data) {
     const char *state_names[] = {
         "IDLE", "WIFI_WAIT", "CONNECTING", "REGISTERING",
         "CONNECTED", "RECONNECTING", "ERROR"
     };
     const char *name = (state < sizeof(state_names)/sizeof(state_names[0]))
                        ? state_names[state] : "UNKNOWN";
-    ESP_LOGI(TAG, "MicroLink state: %s", name);
+    ESP_LOGI(TAG, "TailTiny state: %s", name);
 
     if (state == ML_STATE_CONNECTED) {
-        uint32_t ip = microlink_get_vpn_ip(ml_handle);
+        uint32_t ip = tailtiny_get_vpn_ip(ml_handle);
         char ip_str[16];
-        microlink_ip_to_str(ip, ip_str);
+        tailtiny_ip_to_str(ip, ip_str);
         ESP_LOGI(TAG, "Connected! VPN IP: %s", ip_str);
     }
 }
 
-static void on_peer_update(microlink_t *ml_handle, const microlink_peer_info_t *peer,
+static void on_peer_update(tailtiny_t *ml_handle, const tailtiny_peer_info_t *peer,
                              void *user_data) {
     char ip_str[16];
-    microlink_ip_to_str(peer->vpn_ip, ip_str);
+    tailtiny_ip_to_str(peer->vpn_ip, ip_str);
     ESP_LOGI(TAG, "Peer: %s (%s) online=%d direct=%d",
              peer->hostname, ip_str, peer->online, peer->direct_path);
 }
@@ -217,7 +217,7 @@ static void wifi_init(void) {
  * ========================================================================== */
 
 void app_main(void) {
-    /* Initialize NVS (required for WiFi + MicroLink key storage) */
+    /* Initialize NVS (required for WiFi + TailTiny key storage) */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -225,7 +225,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "MicroLink v2 Basic Connect + Messaging Example");
+    ESP_LOGI(TAG, "TailTiny Basic Connect + Messaging Example");
     ESP_LOGI(TAG, "Free heap: %lu bytes (PSRAM: %lu bytes)",
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -258,10 +258,10 @@ void app_main(void) {
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
                          pdFALSE, pdTRUE, portMAX_DELAY);
 
-    /* Initialize MicroLink
-     * Auth key and device name come from Kconfig here, but microlink_init()
+    /* Initialize TailTiny
+     * Auth key and device name come from Kconfig here, but tailtiny_init()
      * will override them with NVS-saved values if available (from web config UI). */
-    microlink_config_t config = {
+    tailtiny_config_t config = {
         .auth_key = CONFIG_ML_TAILSCALE_AUTH_KEY,
         .device_name = CONFIG_ML_DEVICE_NAME,
         .enable_derp = true,
@@ -271,38 +271,38 @@ void app_main(void) {
         .wifi_tx_power_dbm = 13,  /* Reduced for thermal management */
     };
 
-    ml = microlink_init(&config);
+    ml = tailtiny_init(&config);
     if (!ml) {
-        ESP_LOGE(TAG, "Failed to initialize MicroLink");
+        ESP_LOGE(TAG, "Failed to initialize TailTiny");
         return;
     }
 
     /* Register callbacks */
-    microlink_set_state_callback(ml, on_state_change, NULL);
-    microlink_set_peer_callback(ml, on_peer_update, NULL);
+    tailtiny_set_state_callback(ml, on_state_change, NULL);
+    tailtiny_set_peer_callback(ml, on_peer_update, NULL);
 
     /* Start connecting */
-    ESP_ERROR_CHECK(microlink_start(ml));
+    ESP_ERROR_CHECK(tailtiny_start(ml));
 
     /* Wait for CONNECTED state before creating UDP socket */
-    while (!microlink_is_connected(ml)) {
+    while (!tailtiny_is_connected(ml)) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     /* Create UDP socket on port 9000 */
-    udp_sock = microlink_udp_create(ml, MSG_PORT);
+    udp_sock = tailtiny_udp_create(ml, MSG_PORT);
     if (!udp_sock) {
         ESP_LOGE(TAG, "Failed to create UDP socket");
     } else {
         ESP_LOGI(TAG, "UDP socket listening on port %d", MSG_PORT);
-        microlink_udp_set_rx_callback(udp_sock, on_udp_rx, NULL);
+        tailtiny_udp_set_rx_callback(udp_sock, on_udp_rx, NULL);
     }
 
     /* Parse target peer IP from Kconfig (if set) */
     uint32_t target_ip = 0;
     const char *target_ip_str = CONFIG_ML_EXAMPLE_TARGET_PEER_IP;
     if (target_ip_str && target_ip_str[0] != '\0') {
-        target_ip = microlink_parse_ip(target_ip_str);
+        target_ip = tailtiny_parse_ip(target_ip_str);
         if (target_ip != 0) {
             ESP_LOGI(TAG, "Will send messages to %s:%d every %dms",
                      target_ip_str, MSG_PORT, MSG_SEND_INTERVAL_MS);
@@ -328,7 +328,7 @@ void app_main(void) {
             msg_tx_count++;
             char msg[128];
             int msg_len = snprintf(msg, sizeof(msg), "hello from ESP32 #%lu", (unsigned long)msg_tx_count);
-            esp_err_t err = microlink_udp_send(udp_sock, target_ip, MSG_PORT, msg, msg_len);
+            esp_err_t err = tailtiny_udp_send(udp_sock, target_ip, MSG_PORT, msg, msg_len);
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "UDP TX #%lu -> %s:%d: \"%s\"",
                          (unsigned long)msg_tx_count, target_ip_str, MSG_PORT, msg);
@@ -342,17 +342,17 @@ void app_main(void) {
         if (now - last_status_ms >= 30000) {
             last_status_ms = now;
 
-            if (microlink_is_connected(ml)) {
-                int peer_count = microlink_get_peer_count(ml);
+            if (tailtiny_is_connected(ml)) {
+                int peer_count = tailtiny_get_peer_count(ml);
                 ESP_LOGI(TAG, "Status: CONNECTED | Peers: %d | TX: %lu | RX: %lu | Heap: %lu",
                          peer_count, (unsigned long)msg_tx_count, (unsigned long)msg_rx_count,
                          (unsigned long)esp_get_free_heap_size());
 
                 for (int i = 0; i < peer_count; i++) {
-                    microlink_peer_info_t info;
-                    if (microlink_get_peer_info(ml, i, &info) == ESP_OK) {
+                    tailtiny_peer_info_t info;
+                    if (tailtiny_get_peer_info(ml, i, &info) == ESP_OK) {
                         char ip_str[16];
-                        microlink_ip_to_str(info.vpn_ip, ip_str);
+                        tailtiny_ip_to_str(info.vpn_ip, ip_str);
                         ESP_LOGI(TAG, "  [%d] %s (%s) %s %s",
                                  i, info.hostname, ip_str,
                                  info.online ? "online" : "offline",

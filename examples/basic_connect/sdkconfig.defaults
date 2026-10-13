@@ -1,4 +1,4 @@
-# MicroLink basic_connect: settings for every ESP32 chip.
+# TailTiny basic_connect: settings for every ESP32 chip.
 # Chip-specific extras live in sdkconfig.defaults.<chip> (e.g. .esp32s3),
 # which ESP-IDF loads automatically after `idf.py set-target <chip>`.
 # Buffer sizes are picked automatically: large with PSRAM, small without.

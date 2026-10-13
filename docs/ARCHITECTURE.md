@@ -1,8 +1,8 @@
-# MicroLink v2 Architecture
+# TailTiny Architecture
 
 ## Task Model
 
-MicroLink v2 runs 4 independent FreeRTOS tasks communicating via queues:
+TailTiny runs 4 independent FreeRTOS tasks communicating via queues:
 
 | Task | Stack | Purpose |
 |---|---|---|
@@ -39,7 +39,7 @@ IDLE → WIFI_CONNECTING → WIFI_VPN_UP → [health fail x3] → SWITCHING_TO_C
     → WIFI_CONNECTING → WIFI_VPN_UP (or back to CELL_VPN_UP if WiFi still down)
 ```
 
-Health check: periodic timer checks `microlink_is_connected()`. After 3 consecutive failures, triggers switch.
+Health check: periodic timer checks `tailtiny_is_connected()`. After 3 consecutive failures, triggers switch.
 
 ## Cellular DERP Optimizations
 
@@ -67,7 +67,7 @@ Health check: periodic timer checks `microlink_is_connected()`. After 3 consecut
 
 | File | Purpose |
 |---|---|
-| `microlink.c` | Public API, init/start/stop/destroy |
+| `tailtiny.c` | Public API, init/start/stop/destroy |
 | `ml_coord.c` | Tailscale control plane (Noise IK, HTTP/2 long-poll) |
 | `ml_derp.c` | DERP relay client + TX task |
 | `ml_net_io.c` | Unified network I/O select loop |

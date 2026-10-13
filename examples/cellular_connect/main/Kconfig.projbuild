@@ -12,8 +12,8 @@ menu "Cellular Connect Example"
         default ML_EXAMPLE_UDP
         help
             Choose UDP or TCP for sending data to the target peer.
-            UDP: Uses microlink_udp_send (fire-and-forget, low overhead).
-            TCP: Uses microlink_tcp_connect/send (reliable, connection-oriented).
+            UDP: Uses tailtiny_udp_send (fire-and-forget, low overhead).
+            TCP: Uses tailtiny_tcp_connect/send (reliable, connection-oriented).
 
         config ML_EXAMPLE_UDP
             bool "UDP"

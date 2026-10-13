@@ -1,6 +1,6 @@
-# MicroLink Testing Guide
+# TailTiny Testing Guide
 
-This guide covers hardware setup, building, flashing, and testing MicroLink examples.
+This guide covers hardware setup, building, flashing, and testing TailTiny examples.
 
 ## Prerequisites
 
@@ -51,7 +51,7 @@ Use the `lilygo_sim7670g` example — pin configuration is preset in sdkconfig.d
    CONFIG_ML_CELLULAR_APN="your-apn"
    ```
 
-3. Or set interactively: `idf.py menuconfig` → MicroLink V2 → Credentials
+3. Or set interactively: `idf.py menuconfig` → TailTiny → Credentials
 
 ## Build & Flash
 

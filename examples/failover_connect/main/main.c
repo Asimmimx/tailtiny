@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief WiFi/Cellular Failover — MicroLink Network Switching Demo
+ * @brief WiFi/Cellular Failover — TailTiny Network Switching Demo
  *
  * Connects via WiFi first. If WiFi fails, falls back to cellular (SIM7600).
  * When on cellular, periodically checks if WiFi has recovered and fails back.
@@ -27,7 +27,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 
-#include "microlink.h"
+#include "tailtiny.h"
 #include "ml_net_switch.h"
 #include "ml_config_httpd.h"     /* NVS WiFi override at boot */
 
@@ -69,7 +69,7 @@ void app_main(void)
 
     printf("\n");
     printf("================================================================\n");
-    printf("  MicroLink WiFi/Cellular Failover Demo\n");
+    printf("  TailTiny WiFi/Cellular Failover Demo\n");
     printf("  WiFi: %s\n", CONFIG_ML_WIFI_SSID);
     printf("  Cellular: %s (APN: %s)\n",
 #if defined(CONFIG_ML_BOARD_LILYGO_T_SIM7670G)
@@ -107,22 +107,22 @@ void app_main(void)
     /* Wait for VPN connection */
     ESP_LOGI(TAG, "Waiting for VPN connection...");
     while (!ml_net_switch_get_handle() ||
-           !microlink_is_connected(ml_net_switch_get_handle())) {
+           !tailtiny_is_connected(ml_net_switch_get_handle())) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         ESP_LOGI(TAG, "  %s", ml_net_switch_state_str(ml_net_switch_get_state()));
     }
 
     /* Create UDP socket */
-    microlink_t *ml = ml_net_switch_get_handle();
-    microlink_udp_socket_t *sock = microlink_udp_create(ml, UDP_PORT);
+    tailtiny_t *ml = ml_net_switch_get_handle();
+    tailtiny_udp_socket_t *sock = tailtiny_udp_create(ml, UDP_PORT);
     if (!sock) {
         ESP_LOGE(TAG, "Failed to create UDP socket");
         return;
     }
 
-    uint32_t vpn_ip = microlink_get_vpn_ip(ml);
+    uint32_t vpn_ip = tailtiny_get_vpn_ip(ml);
     char ip_str[16];
-    microlink_ip_to_str(vpn_ip, ip_str);
+    tailtiny_ip_to_str(vpn_ip, ip_str);
     ESP_LOGI(TAG, "Ready: %s:%d via %s",
              ip_str, UDP_PORT,
              ml_net_switch_get_active() == ML_NET_WIFI ? "WiFi" : "Cellular");
@@ -130,7 +130,7 @@ void app_main(void)
     uint32_t target_ip = 0;
 #ifdef CONFIG_ML_EXAMPLE_TARGET_PEER_IP
     if (strlen(CONFIG_ML_EXAMPLE_TARGET_PEER_IP) > 0) {
-        target_ip = microlink_parse_ip(CONFIG_ML_EXAMPLE_TARGET_PEER_IP);
+        target_ip = tailtiny_parse_ip(CONFIG_ML_EXAMPLE_TARGET_PEER_IP);
     }
 #endif
 
@@ -146,16 +146,16 @@ void app_main(void)
         uint8_t buf[256];
         size_t len = sizeof(buf) - 1;
 
-        if (microlink_udp_recv(sock, &src_ip, &src_port, buf, &len, 0) == ESP_OK && len > 0) {
+        if (tailtiny_udp_recv(sock, &src_ip, &src_port, buf, &len, 0) == ESP_OK && len > 0) {
             buf[len] = '\0';
             char src[16];
-            microlink_ip_to_str(src_ip, src);
+            tailtiny_ip_to_str(src_ip, src);
             ESP_LOGI(TAG, "RX [%s:%u]: %s", src, src_port, buf);
             rx_count++;
 
             if (strncmp((char *)buf, "ping", 4) == 0) {
                 const char *pong = "pong";
-                microlink_udp_send(sock, src_ip, src_port, pong, strlen(pong));
+                tailtiny_udp_send(sock, src_ip, src_port, pong, strlen(pong));
             }
         }
 
@@ -166,7 +166,7 @@ void app_main(void)
             snprintf(msg, sizeof(msg), "failover-test #%lu via %s",
                      (unsigned long)tx_count++,
                      ml_net_switch_get_active() == ML_NET_WIFI ? "wifi" : "cell");
-            microlink_udp_send(sock, target_ip, UDP_PORT, msg, strlen(msg));
+            tailtiny_udp_send(sock, target_ip, UDP_PORT, msg, strlen(msg));
         }
 
         /* Status every 10s */

@@ -1,6 +1,6 @@
-# AGENTS.md: setting up MicroLink with an AI assistant
+# AGENTS.md: setting up TailTiny with an AI assistant
 
-This file is for AI coding assistants (Claude Code, Codex, Cursor, Copilot, and others). It describes the exact steps for putting MicroLink on a user's ESP32 board. Follow it from top to bottom. Every command below has been run on real hardware.
+This file is for AI coding assistants (Claude Code, Codex, Cursor, Copilot, and others). It describes the exact steps for putting TailTiny on a user's ESP32 board. Follow it from top to bottom. Every command below has been run on real hardware.
 
 **Goal:** the user's ESP32 joins their Tailscale network and replies to a UDP echo over it.
 
@@ -74,15 +74,15 @@ Then check that the chip is supported:
 | ESP32-C3 | Supported, tested on hardware. Continue |
 | ESP32-S3, ESP32, ESP32-C6 | Should work. Continue, and tell the user it hasn't been hardware-tested with this fork |
 | ESP32-S2 | Continue only if the board has PSRAM (log line `Found ... PSRAM`). Otherwise RAM is too tight |
-| ESP32-C2 | Warn that it is very likely too small: MicroLink needs ~185 KB free after WiFi, a C2 has ~95 KB (~169 KB with deep tuning). Continue only if the user wants to try |
+| ESP32-C2 | Warn that it is very likely too small: TailTiny needs ~185 KB free after WiFi, a C2 has ~95 KB (~169 KB with deep tuning). Continue only if the user wants to try |
 | ESP32-C5, ESP32-C61 | Need ESP-IDF 5.5+. Not tested yet |
 | ESP32-H2, ESP32-P4 | **Stop.** No built-in WiFi. Tell the user they need a different board |
 
 ## Step 4. Get the code
 
 ```bash
-git clone https://github.com/Asimmimx/microlink.git
-cd microlink/examples/basic_connect
+git clone https://github.com/Asimmimx/tailtiny.git
+cd tailtiny/examples/basic_connect
 ```
 
 If the user already has a clone, `git pull` it. Old upstream copies fail on Windows with `Failed to resolve component 'wireguard_lwip'`.
@@ -129,7 +129,7 @@ It ends with `RESULT: connected, VPN IP 100.x.y.z` (exit code 0) once these line
 
 ```
 main: WiFi connected to <ssid>, IP: 192.168.x.y
-main: MicroLink state: CONNECTED
+main: TailTiny state: CONNECTED
 main: Connected! VPN IP: 100.x.y.z
 ```
 
@@ -160,22 +160,22 @@ Finally, tell the user to open <https://login.tailscale.com/admin/machines>, fin
 | `idf.py: command not found` | ESP-IDF not activated in this shell | Step 1 |
 | Build OK, flash: `Failed to connect to ESP32` | Board not in download mode or port busy | Close other serial monitors; BOOT+RESET (step 6) |
 
-## Adding MicroLink to an existing project
+## Adding TailTiny to an existing project
 
 1. Copy `examples/basic_connect/sdkconfig.defaults` (and `sdkconfig.defaults.esp32s3` if they use an S3) into the project.
 2. In the project's top-level `CMakeLists.txt`, before `include($ENV{IDF_PATH}/tools/cmake/project.cmake)`, add:
    ```cmake
-   set(EXTRA_COMPONENT_DIRS "<path>/microlink/components/microlink")
+   set(EXTRA_COMPONENT_DIRS "<path>/tailtiny/components/tailtiny")
    ```
-3. Add `microlink` to the `REQUIRES` of the component that uses it.
-4. Use `examples/basic_connect/main/main.c` as the template: WiFi first, then `microlink_init()`, `microlink_start()`, and wait for `microlink_is_connected()`. API details are in `docs/REFERENCE.md`.
+3. Add `tailtiny` to the `REQUIRES` of the component that uses it.
+4. Use `examples/basic_connect/main/main.c` as the template: WiFi first, then `tailtiny_init()`, `tailtiny_start()`, and wait for `tailtiny_is_connected()`. API details are in `docs/REFERENCE.md`.
 
 ## Repository map
 
 | Path | What |
 |---|---|
-| `components/microlink/` | The library. Add this one folder to your project |
-| `components/microlink/components/wireguard_lwip/` | WireGuard. Pulled in automatically via `idf_component.yml` |
+| `components/tailtiny/` | The library. Add this one folder to your project |
+| `components/tailtiny/components/wireguard_lwip/` | WireGuard. Pulled in automatically via `idf_component.yml` |
 | `examples/basic_connect/` | Minimal app: join the tailnet, UDP echo on port 9000 |
 | `docs/REFERENCE.md` | Full API, configuration options, cellular, troubleshooting |
 | `docs/compat/compat.json` | Chip support data behind `docs/compatibility.svg` |
