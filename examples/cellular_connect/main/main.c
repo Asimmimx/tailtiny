@@ -50,8 +50,10 @@ static tailtiny_t *ml = NULL;
 /* UDP socket (used in UDP mode) */
 static tailtiny_udp_socket_t *udp_sock = NULL;
 
+#ifdef CONFIG_ML_EXAMPLE_TCP
 /* TCP socket (used in TCP mode) */
 static tailtiny_tcp_socket_t *tcp_sock = NULL;
+#endif
 
 /* Message counters */
 static uint32_t msg_tx_count = 0;
@@ -374,7 +376,9 @@ void app_main(void) {
      * Main loop — send messages (UDP mode), print status
      * ================================================================ */
 
+#ifndef CONFIG_ML_EXAMPLE_TCP
     uint64_t last_send_ms = 0;
+#endif
     uint64_t last_status_ms = 0;
 
     while (1) {

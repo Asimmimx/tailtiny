@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.0.2 (2026-10-13)
+
+### Fixes
+
+- **Config web server: no out-of-bounds read on a damaged peer allowlist.** When an allowlist saved by an old version was loaded, the peer count stored in it was not checked against the size of the saved data. A damaged or cut-short entry in NVS made the copy read past the end of the buffer. The count is now limited to the entries actually stored; if it doesn't fit, the list is dropped. The old limit check also did nothing when `CONFIG_ML_CONFIG_MAX_ALLOWED_PEERS` was 255 or more (512 in the S3 examples).
+- **`cellular_connect` builds without warnings in both UDP and TCP mode.**
+
+All five examples build with ESP-IDF v5.3.2 with no warnings.
+
 ## v3.0.1 (2026-10-13)
 
 Completes the v3.0.0 notes and finishes the rename. No change to how the library works.

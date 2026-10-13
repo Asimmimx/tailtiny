@@ -151,7 +151,7 @@ echo "hello" | nc -u 100.x.y.z 9000      # the example echoes it back
 
 ## What this fork fixes
 
-Compared with upstream v2.1.0 (latest release: [v3.0.1](https://github.com/Asimmimx/tailtiny/releases/tag/v3.0.1)). Every item was checked on real hardware; the numbers are from an ESP32-C3 without PSRAM:
+Compared with upstream v2.1.0 (latest release: [v3.0.2](https://github.com/Asimmimx/tailtiny/releases/tag/v3.0.2)). Every item was checked on real hardware; the numbers are from an ESP32-C3 without PSRAM:
 
 - **Runs on ESP32-C3/C6 and boards without PSRAM.** Upstream reboot-looped on single-core chips and ran out of memory without PSRAM.
 - **No more crash** when a packet arrives while a socket is opening ([#17](https://github.com/CamM2325/microlink/issues/17)).
