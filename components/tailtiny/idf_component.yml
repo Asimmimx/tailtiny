@@ -1,4 +1,4 @@
-version: "3.0.0"
+version: "3.0.1"
 description: "Tailscale client for ESP32: WireGuard, DERP relay, DISCO, MagicDNS"
 url: "https://github.com/Asimmimx/tailtiny"
 dependencies:

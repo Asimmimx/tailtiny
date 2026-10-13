@@ -1,5 +1,29 @@
 # Changelog
 
+## v3.0.1 (2026-10-13)
+
+Completes the v3.0.0 notes and finishes the rename. No change to how the library works.
+
+### Log output changed in v3.0.0 (missing from its notes)
+
+| Before | After |
+|---|---|
+| Log tag `microlink` | `tailtiny` |
+| `MicroLink v2 initialized (max_peers=N)` | `TailTiny initialized (max_peers=N)` |
+| Config web page title "MicroLink" | "TailTiny" |
+| Example logs: "MicroLink state", "Failed to initialize MicroLink", ... | "TailTiny state", "Failed to initialize TailTiny", ... |
+
+If you call `esp_log_level_set("microlink", ...)`, or a script or test rig looks for `microlink` or `MicroLink v2 initialized` in the serial output, change it to `tailtiny` / `TailTiny initialized`.
+
+### Examples
+
+All examples now build as `tailtiny_<name>` (for example `build/tailtiny_failover_connect.bin`). v3.0.0 had renamed only `basic_connect` and `cellular_connect`; `cellular_heartbeat`, `failover_connect` and `rebind_test` follow now.
+
+### Code comments
+
+- The NVS namespace `"microlink"` now has a comment explaining why it must not be renamed (devices would lose their Tailscale identity).
+- Source references point again to the upstream MicroLink v1 files they came from.
+
 ## v3.0.0 (2026-10-13)
 
 MicroLink is now **TailTiny**. Only the name changed; the code does the same as v2.3.1.

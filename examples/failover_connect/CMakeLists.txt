@@ -5,4 +5,4 @@ set(EXTRA_COMPONENT_DIRS
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(failover_connect)
+project(tailtiny_failover_connect)

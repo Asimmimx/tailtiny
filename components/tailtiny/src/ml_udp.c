@@ -8,7 +8,7 @@
  * On socket creation, sends CallMeMaybe to all peers to trigger
  * peer-initiated WireGuard handshakes (NAT traversal).
  *
- * Reference: tailtiny v1 tailtiny_udp.c
+ * Reference: upstream MicroLink v1 microlink_udp.c
  */
 
 #include "tailtiny_internal.h"

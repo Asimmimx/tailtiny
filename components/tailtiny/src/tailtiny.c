@@ -26,7 +26,10 @@
 
 static const char *TAG = "tailtiny";
 
-/* NVS keys */
+/* NVS keys.
+ * Keep the namespace "microlink" even though the library is now TailTiny:
+ * renaming it would make every device updated from v2.x lose its machine,
+ * WireGuard and DISCO keys and need a new auth key. */
 #define NVS_NAMESPACE       "microlink"
 #define NVS_KEY_MACHINE_PRI "machine_pri"
 #define NVS_KEY_MACHINE_PUB "machine_pub"

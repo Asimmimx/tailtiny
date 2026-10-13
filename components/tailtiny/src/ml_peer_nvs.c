@@ -10,7 +10,7 @@
  * Supports up to ML_NVS_MAX_PEERS (64) with LRU eviction when full.
  * The entire table is written as one blob (~5.8KB max) for efficiency.
  *
- * Reference: tailtiny v1 tailtiny_peer_registry.c
+ * Reference: upstream MicroLink v1 microlink_peer_registry.c
  */
 
 #include "tailtiny_internal.h"
