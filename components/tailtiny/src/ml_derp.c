@@ -27,6 +27,9 @@
 #include "lwip/netdb.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/error.h"
+#if CONFIG_ML_DERP_VERIFY_CERT
+#include "esp_crt_bundle.h"
+#endif
 #include "nacl_box.h"
 #include <string.h>
 #include <errno.h>
@@ -880,7 +883,18 @@ esp_err_t ml_derp_connect(tailtiny_t *ml) {
         derp_connect_abort(ml, sock);
         return ESP_FAIL;
     }
+#if CONFIG_ML_DERP_VERIFY_CERT
+    /* Check the relay's certificate against ESP-IDF's CA bundle, and its host
+     * name (mbedtls_ssl_set_hostname() below). */
+    mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    if (esp_crt_bundle_attach(&ml->derp.ssl_conf) != ESP_OK) {
+        ESP_LOGE(TAG, "TLS setup failed: could not attach the CA bundle");
+        derp_connect_abort(ml, sock);
+        return ESP_FAIL;
+    }
+#else
     mbedtls_ssl_conf_authmode(&ml->derp.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+#endif
     mbedtls_ssl_conf_rng(&ml->derp.ssl_conf, mbedtls_ctr_drbg_random, &ml->derp.ctr_drbg);
     mbedtls_ssl_conf_read_timeout(&ml->derp.ssl_conf, DERP_CONNECT_TIMEOUT_MS);
 
@@ -913,6 +927,14 @@ esp_err_t ml_derp_connect(tailtiny_t *ml) {
         char err_buf[128];
         mbedtls_strerror(ret, err_buf, sizeof(err_buf));
         ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
+#if CONFIG_ML_DERP_VERIFY_CERT
+        uint32_t flags = mbedtls_ssl_get_verify_result(&ml->derp.ssl);
+        if (flags != 0 && flags != (uint32_t)-1) {
+            char why[160];
+            mbedtls_x509_crt_verify_info(why, sizeof(why), "", flags);
+            ESP_LOGE(TAG, "DERP certificate for %s not accepted: %s", derp_host, why);
+        }
+#endif
         derp_connect_abort(ml, sock);
         return ESP_FAIL;
     }

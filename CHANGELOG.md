@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **DERP: the relay's TLS certificate is verified.** The DERP connection used `MBEDTLS_SSL_VERIFY_NONE`, so anyone on the network path could pose as the relay. WireGuard still protected what it carried, but a fake relay could silently drop or delay it. The certificate is now checked against ESP-IDF's certificate bundle and the relay's host name (new `CONFIG_ML_DERP_VERIFY_CERT`, on by default; it needs `MBEDTLS_CERTIFICATE_BUNDLE`, also on by default). Tailscale's relays chain to ISRG Root X1, which the bundle has, from ESP-IDF v5.3.2 on. It links ESP-IDF's certificate bundle: about +70 KB of flash with the default full bundle, +21 KB with `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN`. Turn it off for a self-hosted DERP server with a private certificate. A refused certificate is logged with the reason.
+
 ## v3.0.2 (2026-10-13)
 
 ### Fixes
