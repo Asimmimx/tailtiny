@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **WireGuard: the timer task and lwIP's thread no longer share keypairs without a lock.** Since the timers moved off lwIP's thread (`wireguardif_periodic()` on the WireGuard manager task), keepalives, handshakes, key expiry and incoming packets ran on that task while lwIP's thread encrypted outgoing data, with nothing between them. A keepalive and a data packet could take the same sending counter (the same ChaCha20-Poly1305 nonce under the same key), and a key could be wiped while a packet was being encrypted with it ([#1](https://github.com/Asimmimx/tailtiny/issues/1)). Each WireGuard device now has a mutex (`wireguard-platform.h`), held for everything that reads or changes keypairs, counters, handshake state and the peer table. Sends happen after it's released, to a copy of the peer's endpoint, because the UDP send waits for lwIP's thread (`ml_tcpip_run()`), which may be waiting for the lock. `tests/host/check_wg_locking.py` checks that rule in `wireguardif.c`; on v3.0.2's file it finds 35 unlocked calls.
+
 ## v3.0.2 (2026-10-13)
 
 ### Fixes
