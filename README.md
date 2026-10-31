@@ -17,7 +17,7 @@ Put an ESP32 on your [Tailscale](https://tailscale.com) network. Once it's on yo
 | Chip | Status | Notes |
 |---|---|---|
 | ESP32-C3 | ✅ Tested on hardware | Tested with this fork: no PSRAM, single core |
-| ESP32-S3 | 🟡 Should work | The original author's main board. PSRAM recommended |
+| ESP32-S3 | 🟡 Should work | The original author's main board. PSRAM recommended. Reported running on hardware in a downstream ESP-IDF 6.1 port ([#3](https://github.com/Asimmimx/tailtiny/issues/3)) |
 | ESP32 | 🟡 Should work | Tested by the original author (no PSRAM) |
 | ESP32-C6 | 🟡 Should work | Builds. Single core like the C3, with more RAM |
 | ESP32-S2 | 🟠 Low RAM | Builds. RAM use not measured on an S2 yet; use a board with PSRAM (most S2 boards have it) |
