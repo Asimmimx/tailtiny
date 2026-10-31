@@ -50,12 +50,21 @@ def code_lines(path):
 
 
 def functions(path):
-    name, depth, body = None, 0, []
+    """(name, lines) for each function. A function's brace may be on its definition line or
+    the next; any other top-level brace that opens neither a type nor an initializer is an
+    error, so a layout change can't drop a function from the check."""
+    name, pending, depth, body = None, None, 0, []
     for number, code in code_lines(path):
         if depth == 0:
             definition = re.match(r'^(?:static\s+)?[\w\s\*]+?\b(\w+)\s*\([^;]*$', code)
             if definition and '{' in code:
-                name, body = definition.group(1), []
+                name, body, pending = definition.group(1), [], None
+            elif definition:
+                pending = definition.group(1)
+            elif pending and '{' in code:  # the brace after a signature that spans lines
+                name, body, pending = pending, [], None
+            elif '{' in code and not re.match(r'\s*#|\s*(?:static\s+|const\s+)*(?:struct|union|enum)\b|.*=\s*\{', code):
+                raise SystemExit(f'{os.path.basename(path)}:{number}: a top-level brace the check can\'t place')
         if name:
             body.append((number, code))
         depth += code.count('{') - code.count('}')
@@ -89,7 +98,22 @@ def check(path):
     return problems
 
 
+def self_test():
+    """The parser must see a function whose brace is on its own line."""
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.c', delete=False, encoding='utf-8') as f:
+        f.write('static void wireguardif_process_response_message(struct wireguard_device *device)\n'
+                '{\n\twireguard_start_session(peer, true);\n}\n')
+    try:
+        names = [name for name, _ in functions(f.name)]
+        assert names == ['wireguardif_process_response_message'], names
+        assert check(f.name)[0].endswith('calls wireguard_start_session without the lock'), check(f.name)
+    finally:
+        os.unlink(f.name)
+
+
 if __name__ == '__main__':
+    self_test()
     problems = check(sys.argv[1] if len(sys.argv) > 1 else SRC)
     for p in problems:
         print('wireguardif.c', p)
