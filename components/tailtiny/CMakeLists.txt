@@ -28,11 +28,18 @@ set(REQUIRES
     esp_timer
     lwip
     mbedtls
-    json
     driver
     esp_driver_tsens
     esp_http_server
 )
+
+# ESP-IDF 6 no longer ships cJSON as the `json` component; it comes from the
+# component registry instead (idf_component.yml).
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    list(APPEND REQUIRES espressif__cjson)
+else()
+    list(APPEND REQUIRES json)
+endif()
 
 idf_component_register(
     SRCS ${SRCS}
