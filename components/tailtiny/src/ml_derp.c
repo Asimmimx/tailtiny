@@ -34,6 +34,7 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include "ml_idle_wait.h"
 
 static uint16_t derp_measure_regions(tailtiny_t *ml, uint16_t current,
                                      int64_t *best_us_out, int64_t *current_us);
@@ -294,7 +295,7 @@ static void route_derp_packet(tailtiny_t *ml, uint8_t *data, size_t len,
     memcpy(pkt.src_pubkey, src_pubkey, 32);
 
     QueueHandle_t target = (type == PKT_DISCO) ? ml->disco_rx_queue : ml->wg_rx_queue;
-    if (xQueueSend(target, &pkt, 0) != pdTRUE) {
+    if (ml_wg_queue_send(ml, target, &pkt, 0) != pdTRUE) {
         free(data);
     }
 }
@@ -441,6 +442,33 @@ static int poll_derp_read(tailtiny_t *ml) {
  * DERP TX Queue Processing
  * ========================================================================== */
 
+/* Queued TX and control requests write an eventfd, so they interrupt the same
+ * select() that waits for relay RX. The count stays set until the DERP task
+ * reads it, so a signal is never lost. */
+void ml_derp_wake(tailtiny_t *ml) {
+    if (ml->derp_wake_fd >= 0) {
+        const uint64_t one = 1;
+        (void)write(ml->derp_wake_fd, &one, sizeof(one));
+    }
+}
+
+static void derp_wait_work(tailtiny_t *ml, uint32_t timeout_ms) {
+    const int fd = ml->derp.connected ? ml->derp.sockfd : -1;
+    /* Poll as before where select() can't wait on both: an AT modem socket
+     * isn't a lwIP descriptor, and without VFS select there is no eventfd. */
+    if ((fd >= 0 && ml_at_socket_is_at_fd(fd)) || ml->derp_wake_fd < 0) {
+        vTaskDelay(fd >= 0 ? ML_DELAY_TICKS(1) : pdMS_TO_TICKS(timeout_ms));
+        return;
+    }
+    if ((fd >= 0 && (uxQueueMessagesWaiting(ml->derp_tx_queue) ||
+                    mbedtls_ssl_check_pending(&ml->derp.ssl))) ||
+        (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) return;
+    if (ml_idle_wait(fd, ml->derp_wake_fd, timeout_ms) < 0 && errno != EINTR) {
+        ESP_LOGW(TAG, "DERP readiness wait failed: %d", errno);
+        vTaskDelay(ML_DELAY_TICKS(50));  /* avoid spinning on a bad descriptor */
+    }
+}
+
 /* Queue a packet for DERP TX with backpressure */
 esp_err_t ml_derp_queue_send(tailtiny_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len) {
@@ -462,8 +490,7 @@ esp_err_t ml_derp_queue_send(tailtiny_t *ml, const uint8_t *dest_key,
     bool is_wg_handshake = (len >= 4 && (data[0] == 0x01 || data[0] == 0x02));
 
     /* Try to send to queue */
-    if ((is_wg_handshake ? xQueueSendToFront(ml->derp_tx_queue, &item, 0)
-                         : xQueueSend(ml->derp_tx_queue, &item, 0)) == pdTRUE) {
+    if (ml_derp_queue_item(ml, &item, is_wg_handshake) == pdTRUE) {
         return ESP_OK;
     }
 
@@ -473,7 +500,7 @@ esp_err_t ml_derp_queue_send(tailtiny_t *ml, const uint8_t *dest_key,
         if (xQueueReceive(ml->derp_tx_queue, &dropped, 0) == pdTRUE) {
             free(dropped.data);  /* Drop oldest */
         }
-        if (xQueueSend(ml->derp_tx_queue, &item, 0) == pdTRUE) {
+        if (ml_derp_queue_item(ml, &item, false) == pdTRUE) {
             return ESP_OK;
         }
     }
@@ -600,8 +627,8 @@ void ml_derp_tx_task(void *arg) {
         }
 
         if (!ml->derp.connected) {
-            /* Not connected - just wait and check again */
-            vTaskDelay(pdMS_TO_TICKS(100));
+            /* Control requests wake the same wait even without a socket. */
+            derp_wait_work(ml, 100);
             continue;
         }
 
@@ -658,8 +685,10 @@ void ml_derp_tx_task(void *arg) {
             }
         }
 
-        /* Yield briefly */
-        vTaskDelay(ML_DELAY_TICKS(1));
+        /* Sleep until the relay has data or TX/control work is queued. A
+         * fixed delay here would hold outgoing relay packets back, and a
+         * one-tick yield keeps the chip from entering light sleep. */
+        derp_wait_work(ml, 100);
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");

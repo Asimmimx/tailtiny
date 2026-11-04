@@ -32,6 +32,7 @@ set(REQUIRES
     driver
     esp_driver_tsens
     esp_http_server
+    vfs  # eventfd that wakes the DERP task when TX/control work is queued
 )
 
 idf_component_register(

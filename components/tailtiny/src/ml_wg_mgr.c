@@ -1717,12 +1717,11 @@ void ml_wg_mgr_task(void *arg) {
             ESP_LOGD(TAG, "disco_periodic_probes: %llu ms", (unsigned long long)dt);
         }
 
-        /* Wait up to 10 ms for the next WireGuard packet, so a burst is
-         * handled as it arrives instead of after a fixed sleep (which let the
-         * RX queue overflow under load). Idle cost is unchanged. */
-        if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, pdMS_TO_TICKS(10)) == pdTRUE) {
-            process_wg_packet(ml, &wg_pkt);
-        }
+        /* Every producer for the queues above notifies this task after
+         * queueing. The queues stay the source of truth; the notification is
+         * latched, so work queued after the drain still wakes this wait. The
+         * 100 ms cap keeps timers, STUN and shutdown checks running. */
+        ulTaskNotifyTake(pdTRUE, ML_DELAY_TICKS(100));
     }
 
     /* Shutdown WireGuard interface */

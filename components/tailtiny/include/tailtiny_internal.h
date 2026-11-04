@@ -391,6 +391,7 @@ struct tailtiny_s {
     TaskHandle_t wg_mgr_task;
 
     /* Queues */
+    int derp_wake_fd;                  /* eventfd: wakes select for queued TX/control work */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
     QueueHandle_t disco_rx_queue;       /* net_io -> wg_mgr */
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
@@ -537,6 +538,30 @@ static inline void ml_tcpip_run(void (*fn)(void *arg), void *arg) {
 /* ============================================================================
  * Internal Function Declarations (per-module)
  * ========================================================================== */
+
+/* Wake the WireGuard manager after publishing work to one of its queues.
+ * A task notification is latched, so work published between the task draining
+ * its queues and starting its next wait still wakes it. */
+static inline void ml_wg_wake(tailtiny_t *ml) {
+    if (ml->wg_mgr_task && !(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST))
+        xTaskNotifyGive(ml->wg_mgr_task);
+}
+
+static inline BaseType_t ml_wg_queue_send(tailtiny_t *ml, QueueHandle_t queue,
+                                         const void *item, TickType_t wait) {
+    BaseType_t sent = xQueueSend(queue, item, wait);
+    if (sent == pdTRUE) ml_wg_wake(ml);
+    return sent;
+}
+
+void ml_derp_wake(tailtiny_t *ml);
+
+static inline BaseType_t ml_derp_queue_item(tailtiny_t *ml, const void *item, bool front) {
+    BaseType_t sent = front ? xQueueSendToFront(ml->derp_tx_queue, item, 0)
+                            : xQueueSend(ml->derp_tx_queue, item, 0);
+    if (sent == pdTRUE) ml_derp_wake(ml);
+    return sent;
+}
 
 /* ml_net_io.c */
 void ml_net_io_task(void *arg);
