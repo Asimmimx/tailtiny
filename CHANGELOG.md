@@ -12,6 +12,10 @@
 
 - **cJSON comes from the component registry on ESP-IDF 6.** ESP-IDF 6 no longer ships cJSON as the `json` component, so CMake stopped at `Failed to resolve component 'json'`. On ESP-IDF 6 and later, `idf_component.yml` now pulls `espressif/cjson` and TailTiny requires `espressif__cjson`. ESP-IDF 5 keeps its built-in `json`.
 
+### ESP-IDF 6
+
+- **TailTiny requires the UART and GPIO driver components.** `ml_at_socket.c` and `ml_cellular.c` include `driver/uart.h` and `driver/gpio.h`, which came through `driver` until ESP-IDF 6 split them out. TailTiny now requires `esp_driver_uart` and `esp_driver_gpio`, which exist from ESP-IDF 5.3 on.
+
 ## v3.0.2 (2026-10-13)
 
 ### Fixes

@@ -29,6 +29,8 @@ set(REQUIRES
     lwip
     mbedtls
     driver
+    esp_driver_gpio
+    esp_driver_uart
     esp_driver_tsens
     esp_http_server
 )
