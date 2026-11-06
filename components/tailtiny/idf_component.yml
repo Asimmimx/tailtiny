@@ -5,3 +5,8 @@ dependencies:
   idf: ">=5.3"
   wireguard_lwip:
     path: "components/wireguard_lwip"
+  # ESP-IDF 6 no longer ships cJSON; ESP-IDF 5 keeps its built-in `json` component.
+  espressif/cjson:
+    version: "^1.7.19"
+    rules:
+      - if: "idf_version >=6.0"

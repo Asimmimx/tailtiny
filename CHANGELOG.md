@@ -8,6 +8,10 @@
 - **DERP: the relay's TLS certificate is verified.** The DERP connection used `MBEDTLS_SSL_VERIFY_NONE`, so anyone on the network path could pose as the relay. WireGuard still protected what it carried, but a fake relay could silently drop or delay it. The certificate is now checked against ESP-IDF's certificate bundle and the relay's host name (new `CONFIG_ML_DERP_VERIFY_CERT`, on by default; it needs `MBEDTLS_CERTIFICATE_BUNDLE`, also on by default). Tailscale's relays chain to ISRG Root X1, which the bundle has, from ESP-IDF v5.3.2 on. It links ESP-IDF's certificate bundle: about +70 KB of flash with the default full bundle, +21 KB with `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN`. Turn it off for a self-hosted DERP server with a private certificate. A refused certificate is logged with the reason.
 - **`idf_component.yml` asks for ESP-IDF 5.3 or newer.** It said 5.0, but TailTiny requires `esp_driver_tsens`, which ESP-IDF added in 5.3, so on 5.0 to 5.2 the build stopped at `Failed to resolve component 'esp_driver_tsens'`. The README already says 5.3 or newer.
 
+### ESP-IDF 6
+
+- **cJSON comes from the component registry on ESP-IDF 6.** ESP-IDF 6 no longer ships cJSON as the `json` component, so CMake stopped at `Failed to resolve component 'json'`. On ESP-IDF 6 and later, `idf_component.yml` now pulls `espressif/cjson` and TailTiny requires `espressif__cjson`. ESP-IDF 5 keeps its built-in `json`.
+
 ## v3.0.2 (2026-10-13)
 
 ### Fixes
