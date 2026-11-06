@@ -11,21 +11,9 @@
 ### ESP-IDF 6
 
 - **cJSON comes from the component registry on ESP-IDF 6.** ESP-IDF 6 no longer ships cJSON as the `json` component, so CMake stopped at `Failed to resolve component 'json'`. On ESP-IDF 6 and later, `idf_component.yml` now pulls `espressif/cjson` and TailTiny requires `espressif__cjson`. ESP-IDF 5 keeps its built-in `json`.
-
-### ESP-IDF 6
-
 - **TailTiny requires the UART and GPIO driver components.** `ml_at_socket.c` and `ml_cellular.c` include `driver/uart.h` and `driver/gpio.h`, which came through `driver` until ESP-IDF 6 split them out. TailTiny now requires `esp_driver_uart` and `esp_driver_gpio`, which exist from ESP-IDF 5.3 on.
-
-### ESP-IDF 6
-
 - **Builds with GCC 15.** GCC 15, which ESP-IDF 6 uses, rejects a byte array initialised from a string of exactly its length unless the array is marked `nonstring`, and ESP-IDF builds with `-Werror`. WireGuard's protocol names in `wireguard.c` (`CONSTRUCTION`, `IDENTIFIER`, `LABEL_MAC1`, `LABEL_COOKIE`) and Salsa20's constant in `nacl_box.c` are such arrays on purpose, and are now marked `__attribute__((nonstring))` (GCC 8 and later).
-
-### ESP-IDF 6
-
 - **DERP's TLS works with Mbed TLS 4.** Mbed TLS 4, which ESP-IDF 6 ships, draws TLS randomness from PSA, made its entropy and CTR-DRBG modules private and removed `mbedtls_ssl_conf_rng()`. The DERP connection's entropy and CTR-DRBG contexts, their seeding and freeing, and the `mbedtls_ssl_conf_rng()` call are now compiled only with Mbed TLS 3 (`MBEDTLS_VERSION_MAJOR < 4`). ESP-IDF 6 initialises PSA at startup. Certificate verification (`CONFIG_ML_DERP_VERIFY_CERT`) is unchanged.
-
-### ESP-IDF 6
-
 - **The Noise control channel uses wireguard-lwip's ChaCha20-Poly1305.** Mbed TLS 4, which ESP-IDF 6 ships, made its ChaCha20-Poly1305 API private. `ml_noise.c` now uses the reference implementation that the bundled wireguard-lwip already uses for WireGuard, through `noise_aead_encrypt()`/`noise_aead_decrypt()` in the new `src/ml_noise_aead.h`, on every ESP-IDF version. Tailscale's nonce is 4 zero bytes and then the counter big-endian, while wireguard-lwip writes its counter little-endian into the same 8 bytes, so the wrapper passes the counter byte-swapped. `tests/host/check_noise_aead.py` checks it against RFC 8439's appendix A.5 vector in both byte orders, against messages sealed by Python's `cryptography` for other counters, an empty payload and no associated data, and that a changed byte, associated data, counter or a cut-short message is refused.
 
 ## v3.0.2 (2026-10-13)
