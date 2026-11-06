@@ -16,6 +16,10 @@
 
 - **TailTiny requires the UART and GPIO driver components.** `ml_at_socket.c` and `ml_cellular.c` include `driver/uart.h` and `driver/gpio.h`, which came through `driver` until ESP-IDF 6 split them out. TailTiny now requires `esp_driver_uart` and `esp_driver_gpio`, which exist from ESP-IDF 5.3 on.
 
+### ESP-IDF 6
+
+- **Builds with GCC 15.** GCC 15, which ESP-IDF 6 uses, rejects a byte array initialised from a string of exactly its length unless the array is marked `nonstring`, and ESP-IDF builds with `-Werror`. WireGuard's protocol names in `wireguard.c` (`CONSTRUCTION`, `IDENTIFIER`, `LABEL_MAC1`, `LABEL_COOKIE`) and Salsa20's constant in `nacl_box.c` are such arrays on purpose, and are now marked `__attribute__((nonstring))` (GCC 8 and later).
+
 ## v3.0.2 (2026-10-13)
 
 ### Fixes
