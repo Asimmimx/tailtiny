@@ -20,6 +20,10 @@
 
 - **Builds with GCC 15.** GCC 15, which ESP-IDF 6 uses, rejects a byte array initialised from a string of exactly its length unless the array is marked `nonstring`, and ESP-IDF builds with `-Werror`. WireGuard's protocol names in `wireguard.c` (`CONSTRUCTION`, `IDENTIFIER`, `LABEL_MAC1`, `LABEL_COOKIE`) and Salsa20's constant in `nacl_box.c` are such arrays on purpose, and are now marked `__attribute__((nonstring))` (GCC 8 and later).
 
+### ESP-IDF 6
+
+- **DERP's TLS works with Mbed TLS 4.** Mbed TLS 4, which ESP-IDF 6 ships, draws TLS randomness from PSA, made its entropy and CTR-DRBG modules private and removed `mbedtls_ssl_conf_rng()`. The DERP connection's entropy and CTR-DRBG contexts, their seeding and freeing, and the `mbedtls_ssl_conf_rng()` call are now compiled only with Mbed TLS 3 (`MBEDTLS_VERSION_MAJOR < 4`). ESP-IDF 6 initialises PSA at startup. Certificate verification (`CONFIG_ML_DERP_VERIFY_CERT`) is unchanged.
+
 ## v3.0.2 (2026-10-13)
 
 ### Fixes
