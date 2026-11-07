@@ -33,6 +33,7 @@ set(REQUIRES
     esp_driver_uart
     esp_driver_tsens
     esp_http_server
+    vfs  # eventfd that wakes the DERP task when TX/control work is queued
 )
 
 # ESP-IDF 6 no longer ships cJSON as the `json` component; it comes from the
