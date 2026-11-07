@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 #include "esp_vfs_eventfd.h"
 #include <unistd.h>
+#include <errno.h>
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
@@ -329,9 +330,12 @@ tailtiny_t *tailtiny_init(const tailtiny_config_t *config) {
     if (event_err == ESP_OK || event_err == ESP_ERR_INVALID_STATE)
         ml->derp_wake_fd = eventfd(0, 0);
     if (ml->derp_wake_fd < 0) {
-        ESP_LOGE(TAG, "Could not create DERP readiness wake descriptor");
-        tailtiny_destroy(ml);
-        return NULL;
+        /* For example, the application registered the eventfd VFS with a
+         * small max_fds and has used them all. Not fatal: the DERP task polls
+         * as it did before, as with CONFIG_VFS_SUPPORT_SELECT off. */
+        ESP_LOGW(TAG, "No eventfd for the DERP task (%s, errno %d): it polls, light sleep limited",
+                 esp_err_to_name(event_err), errno);
+        ml->derp_wake_fd = -1;
     }
 #else
     /* Without VFS select() an eventfd can't be waited on with the socket;
@@ -558,7 +562,7 @@ esp_err_t tailtiny_stop(tailtiny_t *ml) {
     ESP_LOGI(TAG, "Stopping...");
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
     ml_derp_wake(ml);
-    if (ml->wg_mgr_task) xTaskNotifyGive(ml->wg_mgr_task);
+    ml_wg_notify(ml);
 
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
      * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call

@@ -79,6 +79,28 @@ def check_wiring():
         problems.append('the DERP task should wait in derp_wait_work() when connected and when not')
     if re.search(r'xQueueReceive\(\s*ml->wg_rx_queue\s*,[^;]*pdMS_TO_TICKS\(\s*10\s*\)', wg):
         problems.append('ml_wg_mgr.c polls wg_rx_queue every 10 ms again')
+    # A missing eventfd falls back to polling; it must not fail tailtiny_init().
+    init = re.search(r'tailtiny_t \*tailtiny_init\s*\([^)]*\)\s*\{(.*?)\n\}', lifecycle, re.S)
+    block = re.search(r'#if CONFIG_VFS_SUPPORT_SELECT(.*?)#else', init.group(1), re.S) if init else None
+    if not block:
+        problems.append('tailtiny_init() should open the eventfd under CONFIG_VFS_SUPPORT_SELECT')
+    elif 'return NULL' in block.group(1) or 'tailtiny_destroy' in block.group(1):
+        problems.append('tailtiny_init() fails when no eventfd can be created (it should poll instead)')
+    # Notifying the WireGuard task can't race its exit: one guarded notify, one guarded exit.
+    notifies = [f for f in files if re.search(r'xTaskNotifyGive\s*\(\s*ml->wg_mgr_task', code(os.path.join(SRC, f)))]
+    if notifies or wg.count('xTaskNotifyGive(task);') != 1:
+        problems.append(f'xTaskNotifyGive(ml->wg_mgr_task) outside ml_wg_notify(): {notifies}')
+    if re.search(r'xTaskNotifyGive\s*\(', header):
+        problems.append('tailtiny_internal.h notifies the WireGuard task directly (use ml_wg_notify)')
+    if 'ml_wg_notify(ml);' not in header:
+        problems.append('ml_wg_wake() should go through ml_wg_notify()')
+    if wg.count('vTaskDelete(NULL)') != 1 or wg.count('wg_mgr_exit(ml);') != 2:
+        problems.append('every WireGuard task exit should go through wg_mgr_exit()')
+    exit_fn = re.search(r'static void wg_mgr_exit\s*\([^)]*\)\s*\{(.*?)\n\}', wg, re.S)
+    if not exit_fn or not re.search(r'ml->wg_mgr_task = NULL;.*int busy = ml->wg_notifiers;.*'
+                                    r'if \(!busy\) break;\s*vTaskDelay\(1\);.*vTaskDelete\(NULL\)',
+                                    exit_fn.group(1), re.S):
+        problems.append('wg_mgr_exit() should clear the handle, wait for notifiers, then delete')
     for fn in ('tailtiny_rebind', 'tailtiny_stop'):
         body = re.search(fn + r'\s*\([^)]*\)\s*\{(.*?)\n\}', lifecycle, re.S)
         if not body or 'ml_derp_wake(ml);' not in body.group(1):

@@ -389,6 +389,7 @@ struct tailtiny_s {
     TaskHandle_t derp_tx_task;
     TaskHandle_t coord_task;
     TaskHandle_t wg_mgr_task;
+    int wg_notifiers;                  /* producers inside ml_wg_notify(), under ml_wg_task_lock */
 
     /* Queues */
     int derp_wake_fd;                  /* eventfd: wakes select for queued TX/control work */
@@ -539,12 +540,17 @@ static inline void ml_tcpip_run(void (*fn)(void *arg), void *arg) {
  * Internal Function Declarations (per-module)
  * ========================================================================== */
 
+/* Notify the WireGuard manager task, if it is running. Safe against the task
+ * exiting at the same time: it clears its handle and waits for notifiers in
+ * flight before deleting itself (ml_wg_mgr.c). */
+void ml_wg_notify(tailtiny_t *ml);
+
 /* Wake the WireGuard manager after publishing work to one of its queues.
  * A task notification is latched, so work published between the task draining
  * its queues and starting its next wait still wakes it. */
 static inline void ml_wg_wake(tailtiny_t *ml) {
-    if (ml->wg_mgr_task && !(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST))
-        xTaskNotifyGive(ml->wg_mgr_task);
+    if (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST))
+        ml_wg_notify(ml);
 }
 
 static inline BaseType_t ml_wg_queue_send(tailtiny_t *ml, QueueHandle_t queue,
