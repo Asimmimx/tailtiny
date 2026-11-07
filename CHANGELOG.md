@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## v3.1.0 (2026-11-07)
+
+Security fixes for WireGuard and DERP, ESP-IDF 6 support, and automatic light sleep while the tailnet is idle. All of it was contributed by [tozes](https://github.com/tozes) in [#2](https://github.com/Asimmimx/tailtiny/pull/2), [#4](https://github.com/Asimmimx/tailtiny/pull/4) and [#6](https://github.com/Asimmimx/tailtiny/pull/6) to [#12](https://github.com/Asimmimx/tailtiny/pull/12).
+
+### Behaviour changes to know about
+
+- **The DERP relay's certificate is now verified** (`CONFIG_ML_DERP_VERIFY_CERT`, on by default). A self-hosted DERP server with a private certificate is refused (`DERP certificate for <host> not accepted: ...`) until you add its CA to the bundle or turn the option off. It adds about 70 KB of flash with the default full bundle, or 21 KB with `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN`.
+- **TailTiny registers ESP-IDF's eventfd VFS** in `tailtiny_init()` (default config) when `CONFIG_VFS_SUPPORT_SELECT` is on. If your application registers it itself with its own config, do that before `tailtiny_init()`: afterwards, `esp_vfs_eventfd_register()` returns `ESP_ERR_INVALID_STATE`. TailTiny reuses a VFS that's already registered.
+- **ESP-IDF 5.0 to 5.2 are refused by the component manifest.** They never built (`esp_driver_tsens` needs 5.3).
+- `basic_connect` is about 4 KB larger for the light-sleep change (eventfd VFS and `select()`).
 
 ### Fixes
 
@@ -19,6 +28,8 @@
 ### Power
 
 - **The DERP and WireGuard tasks sleep until there's work.** The DERP task polled TLS and then yielded for one tick, and the WireGuard task woke every 10 ms to check its RX queue. With `CONFIG_FREERTOS_HZ=100` the chip needs a few idle ticks in a row before automatic light sleep (`CONFIG_FREERTOS_USE_TICKLESS_IDLE`) can engage, so with TailTiny running it almost never did. The DERP task now waits in one `select()` on the relay socket and an eventfd that's written whenever TX or a control request is queued, so outgoing relay packets still go out at once. It skips the wait while TX is queued or Mbed TLS holds decrypted data. The WireGuard task waits for a task notification that every producer for its queues sends. Both waits are capped at 100 ms for timers, reconnects and shutdown. An AT modem socket (cellular) can't be waited on with `select()`, so the DERP task keeps polling it, and it also polls when `CONFIG_VFS_SUPPORT_SELECT` is off or no eventfd can be created (a warning, not an init failure). `tests/host/check_idle_wait.py` runs the wait against a real socket and eventfd and checks the wiring.
+
+All five examples build with ESP-IDF v5.3.2 with no warnings.
 
 ## v3.0.2 (2026-10-13)
 

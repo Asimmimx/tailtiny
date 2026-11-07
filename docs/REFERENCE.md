@@ -51,7 +51,7 @@ Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G ce
 
 ## Requirements
 
-- ESP-IDF v5.0 or later (tested with v5.3)
+- ESP-IDF v5.3 or later (built with v5.3.2 and v6.1)
 - ESP32 with WiFi (ESP32-S3 with PSRAM recommended)
 - Tailscale account with auth key (generate at https://login.tailscale.com/admin/settings/keys)
 - For cellular: ESP32-compatible 4G cellular module (e.g., SIM7600, SIM7670) + active SIM card
@@ -452,7 +452,8 @@ TailTiny Configuration
 │   ├── Maximum cached peers in NVS           (64)
 │   ├── Priority peer VPN IP                  ()
 │   ├── HTTP/2 receive buffer size (KB)       (512)
-│   └── JSON parse buffer size (KB)           (512)
+│   ├── JSON parse buffer size (KB)           (512)
+│   └── Verify the DERP relay's TLS certificate [*]
 ├── Credentials
 │   ├── WiFi SSID                             ()
 │   ├── WiFi Password                         ()
@@ -489,6 +490,7 @@ TailTiny Configuration
 | `ML_PRIORITY_PEER_IP` | Empty | Priority peer VPN IP (e.g., `100.x.y.z`). Guaranteed a WG slot even when peer table is full — LRU non-priority peer is evicted. Also settable via web UI. |
 | `ML_H2_BUFFER_SIZE_KB` | `512` with PSRAM, `80` without | Largest MapResponse accepted (64-2048 KB). The buffer is allocated at the response's actual size, so this is a cap, not a reservation. Rough guide: 64 KB ≈ 30 peers, 512 KB ≈ 300 peers, 2048 KB ≈ 1200 peers. |
 | `ML_JSON_BUFFER_SIZE_KB` | `512` with PSRAM, `64` without | Kept for compatibility. The initial MapResponse no longer uses a separate JSON buffer. |
+| `ML_DERP_VERIFY_CERT` | `y` | Check the DERP relay's TLS certificate against ESP-IDF's certificate bundle and the relay's host name. Needs `MBEDTLS_CERTIFICATE_BUNDLE` (on by default). Costs about 70 KB of flash with the full bundle, or 21 KB with `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN`. Turn it off only for a self-hosted DERP server whose certificate the bundle doesn't know. A refused certificate is logged as `DERP certificate for <host> not accepted: <reason>`. |
 
 #### Credentials
 
@@ -554,6 +556,15 @@ TailTiny supports custom coordination servers like [Headscale](https://github.co
 - If your custom server uses self-signed certificates, add them to the ESP32's certificate bundle
 - TailTiny implements ts2021 — ensure your coordination server supports this version
 - DERP discovery is automatic from the server's `DERPMap`
+- If you run your own DERP server with a private certificate, add its CA to the certificate bundle or turn off `CONFIG_ML_DERP_VERIFY_CERT`
+
+## Power Saving (Automatic Light Sleep)
+
+TailTiny's DERP and WireGuard tasks wait for work instead of polling, so the chip can enter automatic light sleep while the tailnet is idle. To use it, enable `CONFIG_PM_ENABLE` and `CONFIG_FREERTOS_USE_TICKLESS_IDLE` in your project and call `esp_pm_configure()` with `light_sleep_enable = true`. While Wi-Fi is connected, light sleep also needs Wi-Fi modem sleep (`WIFI_PS_MIN_MODEM`, ESP-IDF's default). The examples, and TailTiny's network switching (`CONFIG_ML_ENABLE_NET_SWITCH`), set `WIFI_PS_NONE` for lower latency, so none of them sleep. Modem sleep can add up to one DTIM interval (100–300 ms) of delay when a packet wakes the radio.
+
+Both tasks still wake at least every 100 ms for timers, reconnects and shutdown checks. Measured by a contributor on an ESP32-S3 idle on the tailnet ([#12](https://github.com/Asimmimx/tailtiny/pull/12)): time in light sleep went from 0% to about 12%. With TailTiny not started, the same firmware sleeps about 48% of the time. The rest of the gap is likely other periodic wakeups and keepalive traffic, but that wasn't measured separately.
+
+The DERP task keeps polling in two cases, and init logs a warning for each: when `CONFIG_VFS_SUPPORT_SELECT` is off, and when no eventfd can be created (for example, the application registered the eventfd VFS with a small `max_fds` and has used them all). It also polls on a cellular AT socket, since `select()` can't wait on one.
 
 ## High-Throughput Mode (Zero-Copy WireGuard)
 

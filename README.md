@@ -17,7 +17,7 @@ Put an ESP32 on your [Tailscale](https://tailscale.com) network. Once it's on yo
 | Chip | Status | Notes |
 |---|---|---|
 | ESP32-C3 | ✅ Tested on hardware | Tested with this fork: no PSRAM, single core |
-| ESP32-S3 | 🟡 Should work | The original author's main board. PSRAM recommended. Reported running on hardware in a downstream ESP-IDF 6.1 port ([#3](https://github.com/Asimmimx/tailtiny/issues/3)) |
+| ESP32-S3 | 🟡 Should work | The original author's main board. PSRAM recommended. A contributor runs it on an ESP32-S3 inside their own firmware, built with ESP-IDF 6.1 ([#3](https://github.com/Asimmimx/tailtiny/issues/3), [#12](https://github.com/Asimmimx/tailtiny/pull/12)) |
 | ESP32 | 🟡 Should work | Tested by the original author (no PSRAM) |
 | ESP32-C6 | 🟡 Should work | Builds. Single core like the C3, with more RAM |
 | ESP32-S2 | 🟠 Low RAM | Builds. RAM use not measured on an S2 yet; use a board with PSRAM (most S2 boards have it) |
@@ -48,7 +48,7 @@ The assistant reads [`AGENTS.md`](AGENTS.md). It detects your chip and serial po
 
 ### 1. Install ESP-IDF
 
-Follow Espressif's installer for your OS (v5.3 or newer):
+Follow Espressif's installer for your OS (v5.3 or newer; ESP-IDF 6 works too):
 [Windows](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/windows-setup.html) ·
 [Linux / macOS](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/linux-macos-setup.html)
 
@@ -151,7 +151,7 @@ echo "hello" | nc -u 100.x.y.z 9000      # the example echoes it back
 
 ## What this fork fixes
 
-Compared with upstream v2.1.0 (latest release: [v3.0.2](https://github.com/Asimmimx/tailtiny/releases/tag/v3.0.2)). Every item was checked on real hardware; the numbers are from an ESP32-C3 without PSRAM:
+Compared with upstream v2.1.0 (latest release: [v3.1.0](https://github.com/Asimmimx/tailtiny/releases/tag/v3.1.0)). Every item was checked on real hardware. Unless an item says otherwise, the numbers are from an ESP32-C3 without PSRAM:
 
 - **Runs on ESP32-C3/C6 and boards without PSRAM.** Upstream reboot-looped on single-core chips and ran out of memory without PSRAM.
 - **No more crash** when a packet arrives while a socket is opening ([#17](https://github.com/CamM2325/microlink/issues/17)).
@@ -164,6 +164,10 @@ Compared with upstream v2.1.0 (latest release: [v3.0.2](https://github.com/Asimm
 - **Quieter background traffic:** no flood of `DISCO PONG unmatched` warnings, and endpoints go to the control server only when they change.
 - **DERP keeps reconnecting and no longer leaks memory** ([#37](https://github.com/CamM2325/microlink/pull/37)).
 - **Correct peer online status** ([#24](https://github.com/CamM2325/microlink/pull/24)), plus fixes for [#34](https://github.com/CamM2325/microlink/issues/34), [#36](https://github.com/CamM2325/microlink/issues/36) and [#39](https://github.com/CamM2325/microlink/pull/39).
+- **WireGuard keys are no longer used by two tasks at once.** A keepalive and a data packet could get the same nonce under the same key ([#1](https://github.com/Asimmimx/tailtiny/issues/1)). Checked on an ESP32-S3: 38 minutes of two-way traffic with no stall.
+- **The DERP relay's certificate is checked.** Before, anyone on the network path could pose as the relay. It's on by default (`CONFIG_ML_DERP_VERIFY_CERT`) and adds about 70 KB of flash. Checked on an ESP32-S3 against Tailscale's relays.
+- **Builds with ESP-IDF 6** (cJSON from the registry, the driver split, GCC 15, Mbed TLS 4). Checked on an ESP32-S3 built with ESP-IDF 6.1.
+- **Automatic light sleep works with TailTiny running.** On an ESP32-S3 idle on the tailnet, time in light sleep went from 0% to about 12% ([#12](https://github.com/Asimmimx/tailtiny/pull/12)). Your project turns it on ([how](docs/REFERENCE.md#power-saving-automatic-light-sleep)); the examples don't.
 - **Easier setup:** one component folder, Windows builds, any chip, and a credentials file that actually gets read.
 
 Full list with before/after measurements, behaviour changes and what's still open: **[CHANGELOG.md](CHANGELOG.md)**.
@@ -179,6 +183,7 @@ Full list with before/after measurements, behaviour changes and what's still ope
 | First message right after boot gets no reply | Normal. The first tunnel takes about 15 s to set up |
 | `Failed to resolve component 'wireguard_lwip'` | You're on the old upstream repo. Use this fork |
 | `DERP connect attempt N failed, retrying in ...` | Outbound HTTPS (port 443) is blocked or the internet is down. It keeps retrying by itself |
+| `DERP certificate for ... not accepted: ...` | Your DERP server's certificate isn't in ESP-IDF's certificate bundle (for example, a self-hosted relay with a private certificate). Add its CA to the bundle, or turn off `CONFIG_ML_DERP_VERIFY_CERT` |
 
 More in the [full reference](docs/REFERENCE.md#troubleshooting).
 
