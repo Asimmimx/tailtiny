@@ -6,6 +6,10 @@
 
 - **WireGuard: a handshake after a reboot is no longer dropped.** The handshake initiation's timestamp (TAI64N) was the time since boot. A WireGuard peer drops an initiation whose timestamp isn't newer than the last one it accepted from that key (replay protection; wireguard-go logs `handshake replay`), and after a reboot the time since boot starts again near 0. So every initiation TailTiny sent after a reboot was dropped, and a session only came up once the peer started a handshake itself, or had forgotten the old timestamp. `wireguard_tai64n_now()` now uses the wall clock once it is set (an RTC, SNTP or the application, from 2020 on), and the time since boot only until then. It never goes backwards within a boot, also when SNTP steps the clock back. `tests/host/check_tai64n.py` checks it.
 
+### New options
+
+- **`CONFIG_ML_TASK_DERP_CORE`: the core for the DERP task** (0 or 1, default 0, so nothing changes unless set). The DERP relay's TLS handshake took about 3 s of CPU on an ESP32-S3, at priority 5 on core 0, and a lower-priority task there can't run during it: in one product whose UI loop runs on core 0 at priority 1, the screen froze for 2.6 to 2.9 s at every DERP connect. With the option set to 1 the longest stall around the connect was 257 ms, and the handshake took 3.0 to 3.8 s in the background. This moves the contention to core 1, where lower-priority tasks wait instead. Single-core targets always use core 0.
+
 ### Power
 
 - **Follow-ups to the coord and net_io waits.** A STUN socket the coord task creates wakes net_io, so its first reply isn't held for up to 1 s until net_io's `select()` times out. The WireGuard task's wait is rounded up to whole ticks: rounded down, it often woke a tick before its job was due and then waited again. The init warning for missing eventfds names both tasks when both lack one.
