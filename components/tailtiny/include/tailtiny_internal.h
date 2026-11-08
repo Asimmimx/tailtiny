@@ -399,6 +399,8 @@ struct tailtiny_s {
 
     /* Queues */
     int derp_wake_fd;                  /* eventfd: wakes select for queued TX/control work */
+    int coord_wake_fd;                 /* eventfd: wakes the coord task's long-poll wait */
+    int net_io_wake_fd;                /* eventfd: wakes the net_io task's select() */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
     QueueHandle_t disco_rx_queue;       /* net_io -> wg_mgr */
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
@@ -572,6 +574,21 @@ static inline BaseType_t ml_derp_queue_item(tailtiny_t *ml, const void *item, bo
     BaseType_t sent = front ? xQueueSendToFront(ml->derp_tx_queue, item, 0)
                             : xQueueSend(ml->derp_tx_queue, item, 0);
     if (sent == pdTRUE) ml_derp_wake(ml);
+    return sent;
+}
+
+/* Wake the coord task's long-poll wait (STUN replies, commands, a DERP region
+ * change, stop) and the net_io task's select() (rebind, stop). Like
+ * ml_derp_wake(), an eventfd count stays set until the task reads it, so a
+ * wake sent just before the task starts waiting isn't lost. No-ops without an
+ * eventfd; those tasks then poll as before. */
+void ml_coord_wake(tailtiny_t *ml);
+void ml_net_io_wake(tailtiny_t *ml);
+
+static inline BaseType_t ml_coord_queue_send(tailtiny_t *ml, QueueHandle_t queue,
+                                            const void *item, TickType_t wait) {
+    BaseType_t sent = xQueueSend(queue, item, wait);
+    if (sent == pdTRUE) ml_coord_wake(ml);
     return sent;
 }
 

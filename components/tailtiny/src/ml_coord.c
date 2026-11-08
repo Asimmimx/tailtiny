@@ -22,6 +22,8 @@
  */
 
 #include "tailtiny_internal.h"
+#include "ml_idle_wait.h"
+#include <unistd.h>
 #include "x25519.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -2387,6 +2389,32 @@ static void lp_feed_body(tailtiny_t *ml, const uint8_t *data, size_t len) {
     }
 }
 
+void ml_coord_wake(tailtiny_t *ml) {
+    if (ml->coord_wake_fd >= 0) {
+        const uint64_t one = 1;
+        (void)write(ml->coord_wake_fd, &one, sizeof(one));
+    }
+}
+
+/* The long-poll's idle wait: until the control connection has data, or a STUN
+ * reply, a command, a DERP region change or stop arrives (ml_coord_wake()),
+ * for at most timeout_ms so the periodic work below still runs (the H2 PING
+ * every 5 s and STUN retries every 2 s are the tightest). Without an eventfd,
+ * or on an AT modem socket, it sleeps 50 ms as before. */
+static void coord_wait_work(tailtiny_t *ml, uint32_t timeout_ms) {
+    if (ml->coord_wake_fd < 0 || ml->coord_sock < 0 || ml_at_socket_is_at_fd(ml->coord_sock)) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+    }
+    if (uxQueueMessagesWaiting(ml->stun_rx_queue) || uxQueueMessagesWaiting(ml->coord_cmd_queue) ||
+        (xEventGroupGetBits(ml->events) & (ML_EVT_SHUTDOWN_REQUEST | ML_EVT_DERP_REGION_CHANGED)))
+        return;
+    if (ml_idle_wait(ml->coord_sock, ml->coord_wake_fd, timeout_ms) < 0 && errno != EINTR) {
+        ESP_LOGW(TAG, "Control readiness wait failed: %d", errno);
+        vTaskDelay(pdMS_TO_TICKS(50));  /* avoid spinning on a bad descriptor */
+    }
+}
+
 /* Read whatever the control connection has ready (non-blocking).
  * Returns 2 if long-poll (stream 5) DATA arrived, 1 if only other frames
  * arrived, 0 if nothing was ready, and -1 if the connection or the long-poll
@@ -2400,7 +2428,11 @@ static int poll_map_update(tailtiny_t *ml, ml_noise_state_t *noise) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(ml->coord_sock, &readfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = msgs == 0 ? 50000 : 0 };
+        /* With its eventfd, the coord task has already waited for data in
+         * coord_wait_work(): this only checks. Without it, the first check
+         * waits up to 50 ms, the task's old polling rhythm. */
+        const bool waited = ml->coord_wake_fd >= 0 && !ml_at_socket_is_at_fd(ml->coord_sock);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = (msgs == 0 && !waited) ? 50000 : 0 };
         int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
         if (sel <= 0) break;  /* No data available or error */
 
@@ -2972,7 +3004,7 @@ void ml_coord_task(void *arg) {
                     break;
                 }
 
-                vTaskDelay(pdMS_TO_TICKS(50));
+                coord_wait_work(ml, 1000);
             }
             break;
 

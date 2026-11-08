@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Power
+
+- **The coord and net_io tasks wait for work too, and no task wakes every 100 ms.** With the DERP and WireGuard tasks waiting since 3.1.0, the coord task still checked the control connection for 50 ms and then slept 50 ms, and the net_io task's `select()` timed out every 50 ms: about 30 wake-ups a second between them, so the chip seldom stayed idle long enough to sleep. The coord task's long-poll now waits in one `select()` on the control connection and an eventfd, which STUN replies, commands, a DERP region change and `tailtiny_stop()` write. The net_io task's `select()` includes its own eventfd, which `tailtiny_rebind()` and `tailtiny_stop()` write. Both wait up to 1 s, enough for the H2 PING every 5 s and the STUN retries every 2 s. The DERP task waits up to 1 s while connected (still 100 ms while reconnecting), and the WireGuard task until its next timer is due (every 400 ms, unchanged, since that's where a handshake an outgoing packet asks for is sent) instead of every 100 ms. On an ESP32-S3 idle on the tailnet, time in light sleep went from about 13% to about 33%. Each task falls back to its old polling on its own if its eventfd can't be created, with `CONFIG_VFS_SUPPORT_SELECT` off, and on a cellular AT socket. `tests/host/check_idle_wait.py` checks the new wiring.
+
 ## v3.1.0 (2026-11-07)
 
 Security fixes for WireGuard and DERP, ESP-IDF 6 support, and automatic light sleep while the tailnet is idle. All of it was contributed by [tozes](https://github.com/tozes) in [#2](https://github.com/Asimmimx/tailtiny/pull/2), [#4](https://github.com/Asimmimx/tailtiny/pull/4) and [#6](https://github.com/Asimmimx/tailtiny/pull/6) to [#12](https://github.com/Asimmimx/tailtiny/pull/12).

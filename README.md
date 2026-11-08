@@ -167,7 +167,7 @@ Compared with upstream v2.1.0 (latest release: [v3.1.0](https://github.com/Asimm
 - **WireGuard keys are no longer used by two tasks at once.** A keepalive and a data packet could get the same nonce under the same key ([#1](https://github.com/Asimmimx/tailtiny/issues/1)). Checked on an ESP32-S3: 38 minutes of two-way traffic with no stall.
 - **The DERP relay's certificate is checked.** Before, anyone on the network path could pose as the relay. It's on by default (`CONFIG_ML_DERP_VERIFY_CERT`) and adds about 70 KB of flash. Checked on an ESP32-S3 against Tailscale's relays.
 - **Builds with ESP-IDF 6** (cJSON from the registry, the driver split, GCC 15, Mbed TLS 4). Checked on an ESP32-S3 built with ESP-IDF 6.1.
-- **Automatic light sleep works with TailTiny running.** On an ESP32-S3 idle on the tailnet, time in light sleep went from 0% to about 12% ([#12](https://github.com/Asimmimx/tailtiny/pull/12)). Your project turns it on ([how](docs/REFERENCE.md#power-saving-automatic-light-sleep)); the examples don't.
+- **Automatic light sleep works with TailTiny running.** On an ESP32-S3 idle on the tailnet, time in light sleep went from 0% to about 33%. Your project turns it on ([how](docs/REFERENCE.md#power-saving-automatic-light-sleep)); the examples don't.
 - **Easier setup:** one component folder, Windows builds, any chip, and a credentials file that actually gets read.
 
 Full list with before/after measurements, behaviour changes and what's still open: **[CHANGELOG.md](CHANGELOG.md)**.

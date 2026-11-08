@@ -1752,9 +1752,18 @@ void ml_wg_mgr_task(void *arg) {
 
         /* Every producer for the queues above notifies this task after
          * queueing. The queues stay the source of truth; the notification is
-         * latched, so work queued after the drain still wakes this wait. The
-         * 100 ms cap keeps timers, STUN and shutdown checks running. */
-        ulTaskNotifyTake(pdTRUE, ML_DELAY_TICKS(100));
+         * latched, so work queued after the drain still wakes this wait. It
+         * lasts until the next periodic job is due: WireGuard's timers every
+         * 400 ms (a handshake an outgoing packet asks for is sent from them)
+         * and the DISCO probes every second. */
+        {
+            uint64_t t = ml_get_time_ms();
+            uint64_t due = last_disco_probe_ms + 1001;
+            if (ml->wg_netif && last_wg_periodic_ms + 400 < due) due = last_wg_periodic_ms + 400;
+            uint32_t wait_ms = due > t ? (uint32_t)(due - t) : 0;
+            if (wait_ms > 1000) wait_ms = 1000;
+            ulTaskNotifyTake(pdTRUE, wait_ms ? ML_DELAY_TICKS(wait_ms) : 0);
+        }
     }
 
     /* Shutdown WireGuard interface */

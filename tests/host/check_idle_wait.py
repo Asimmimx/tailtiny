@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks the DERP and WireGuard tasks' idle waits.
+"""Checks the idle waits of TailTiny's tasks (DERP, WireGuard, coord, net_io).
 
     python tests/host/check_idle_wait.py
 
@@ -7,8 +7,8 @@
    ml_idle_wait() against a real socket pair and eventfd. Linux only, since
    eventfd is; skipped elsewhere.
 2. Reads the source for the wiring the runner can't see: every send to a
-   queue the WireGuard or DERP task waits on goes through a helper that wakes
-   that task, and neither task goes back to a short polling delay.
+   queue a task waits on goes through a helper that wakes that task, the tasks
+   don't go back to short polling delays, and stop and rebind wake them.
 
 Exits 1 and lists each problem otherwise.
 """
@@ -23,7 +23,8 @@ COMP = os.path.join(HERE, '..', '..', 'components', 'tailtiny')
 SRC = os.path.join(COMP, 'src')
 CC = os.environ.get('CC', 'gcc')
 
-WAKE_QUEUES = ('wg_rx_queue', 'disco_rx_queue', 'peer_update_queue', 'derp_tx_queue')
+WAKE_QUEUES = ('wg_rx_queue', 'disco_rx_queue', 'peer_update_queue', 'derp_tx_queue',
+               'stun_rx_queue', 'coord_cmd_queue')
 
 
 def code(path):
@@ -53,30 +54,48 @@ def check_wiring():
     raw = re.compile(r'\bxQueueSend(?:ToFront|ToBack)?\s*\(\s*ml->(' + '|'.join(WAKE_QUEUES) + r')\b')
     for name in files:
         for match in raw.finditer(code(os.path.join(SRC, name))):
-            problems.append(f'{name}: raw xQueueSend to {match.group(1)} (use ml_wg_queue_send / ml_derp_queue_item)')
+            problems.append(f'{name}: raw xQueueSend to {match.group(1)} (use ml_wg_queue_send / ml_derp_queue_item / ml_coord_queue_send)')
 
     header = code(os.path.join(COMP, 'include', 'tailtiny_internal.h'))
     derp = code(os.path.join(SRC, 'ml_derp.c'))
     wg = code(os.path.join(SRC, 'ml_wg_mgr.c'))
     zerocopy = code(os.path.join(SRC, 'ml_zerocopy.c'))
     lifecycle = code(os.path.join(SRC, 'tailtiny.c'))
+    coord = code(os.path.join(SRC, 'ml_coord.c'))
+    net_io = code(os.path.join(SRC, 'ml_net_io.c'))
     expect = [
         (header, 'if (sent == pdTRUE) ml_wg_wake(ml);', 'ml_wg_queue_send wakes the WireGuard task'),
         (header, 'if (sent == pdTRUE) ml_derp_wake(ml);', 'ml_derp_queue_item wakes the DERP task'),
         (derp, 'ml_wg_queue_send(ml, target,', 'relayed WireGuard/DISCO packets wake the WireGuard task'),
         (zerocopy, 'ml_wg_wake(ml);', 'the zero-copy DISCO ring wakes the WireGuard task'),
-        (wg, 'ulTaskNotifyTake(pdTRUE, ML_DELAY_TICKS(100))', 'the WireGuard task waits for a notification'),
+        (wg, 'ulTaskNotifyTake(pdTRUE, wait_ms ? ML_DELAY_TICKS(wait_ms) : 0)',
+         'the WireGuard task waits for a notification until its next job is due'),
         (derp, 'uxQueueMessagesWaiting(ml->derp_tx_queue)', 'the DERP wait is skipped while TX is queued'),
         (derp, 'mbedtls_ssl_check_pending(&ml->derp.ssl)', 'the DERP wait is skipped while TLS holds data'),
         (derp, 'ml_idle_wait(fd, ml->derp_wake_fd, timeout_ms)', 'the DERP task waits on socket and eventfd'),
         (lifecycle, 'ml->derp_wake_fd = -1', 'the eventfd starts closed'),
         (lifecycle, 'close(ml->derp_wake_fd)', 'destroy closes the eventfd'),
+        (header, 'if (sent == pdTRUE) ml_coord_wake(ml);', 'ml_coord_queue_send wakes the coord task'),
+        (zerocopy, 'ml_coord_queue_send(ml, ml->stun_rx_queue,', 'zero-copy STUN replies wake the coord task'),
+        (derp, 'ML_EVT_DERP_REGION_CHANGED);\n                    ml_coord_wake(ml);', 'a DERP region change wakes the coord task'),
+        (coord, 'ml_idle_wait(ml->coord_sock, ml->coord_wake_fd, timeout_ms)', 'the coord task waits on its socket and eventfd'),
+        (coord, 'uxQueueMessagesWaiting(ml->stun_rx_queue) || uxQueueMessagesWaiting(ml->coord_cmd_queue)',
+         'the coord wait is skipped while STUN replies or commands are queued'),
+        (coord, 'coord_wait_work(ml, 1000);', 'the long-poll waits in coord_wait_work()'),
+        (net_io, 'FD_SET(ml->net_io_wake_fd, &read_fds);', 'net_io waits on its eventfd too'),
+        (net_io, 'read(ml->net_io_wake_fd, &count, sizeof(count));', 'net_io drains its eventfd'),
+        (lifecycle, 'ml->coord_wake_fd = -1;', 'the coord eventfd starts closed'),
+        (lifecycle, 'ml->net_io_wake_fd = -1;', 'the net_io eventfd starts closed'),
+        (lifecycle, 'close(ml->coord_wake_fd)', 'destroy closes the coord eventfd'),
+        (lifecycle, 'close(ml->net_io_wake_fd)', 'destroy closes the net_io eventfd'),
     ]
     for text, needle, what in expect:
         if needle not in text:
             problems.append(f'missing: {what} ({needle})')
-    if derp.count('derp_wait_work(ml, 100)') != 2:
-        problems.append('the DERP task should wait in derp_wait_work() when connected and when not')
+    if derp.count('derp_wait_work(ml, 1000)') != 1 or derp.count('derp_wait_work(ml, 100)') != 1:
+        problems.append('the DERP task should wait in derp_wait_work(): up to 1 s connected, 100 ms not')
+    if re.search(r'COORD_LONG_POLL.*?vTaskDelay\(\s*pdMS_TO_TICKS\(\s*50\s*\)\s*\)\s*;\s*\}\s*break;', coord, re.S):
+        problems.append('the long-poll sleeps a fixed 50 ms again')
     if re.search(r'xQueueReceive\(\s*ml->wg_rx_queue\s*,[^;]*pdMS_TO_TICKS\(\s*10\s*\)', wg):
         problems.append('ml_wg_mgr.c polls wg_rx_queue every 10 ms again')
     # A missing eventfd falls back to polling; it must not fail tailtiny_init().
@@ -105,6 +124,10 @@ def check_wiring():
         body = re.search(fn + r'\s*\([^)]*\)\s*\{(.*?)\n\}', lifecycle, re.S)
         if not body or 'ml_derp_wake(ml);' not in body.group(1):
             problems.append(f'{fn}() should wake the DERP task')
+        if not body or 'ml_net_io_wake(ml);' not in body.group(1):
+            problems.append(f'{fn}() should wake the net_io task')
+        if not body or ('ml_coord_wake(ml);' not in body.group(1) and 'ml_coord_queue_send(' not in body.group(1)):
+            problems.append(f'{fn}() should wake the coord task')
     print(f'wiring: {len(problems)} problems')
     return problems
 
