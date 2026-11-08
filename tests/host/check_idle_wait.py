@@ -68,8 +68,8 @@ def check_wiring():
         (header, 'if (sent == pdTRUE) ml_derp_wake(ml);', 'ml_derp_queue_item wakes the DERP task'),
         (derp, 'ml_wg_queue_send(ml, target,', 'relayed WireGuard/DISCO packets wake the WireGuard task'),
         (zerocopy, 'ml_wg_wake(ml);', 'the zero-copy DISCO ring wakes the WireGuard task'),
-        (wg, 'ulTaskNotifyTake(pdTRUE, wait_ms ? ML_DELAY_TICKS(wait_ms) : 0)',
-         'the WireGuard task waits for a notification until its next job is due'),
+        (wg, 'ulTaskNotifyTake(pdTRUE, wait_ms ? pdMS_TO_TICKS(wait_ms + portTICK_PERIOD_MS - 1) : 0)',
+         'the WireGuard task waits for a notification until its next job is due, rounded up to ticks'),
         (derp, 'uxQueueMessagesWaiting(ml->derp_tx_queue)', 'the DERP wait is skipped while TX is queued'),
         (derp, 'mbedtls_ssl_check_pending(&ml->derp.ssl)', 'the DERP wait is skipped while TLS holds data'),
         (derp, 'ml_idle_wait(fd, ml->derp_wake_fd, timeout_ms)', 'the DERP task waits on socket and eventfd'),
@@ -92,6 +92,8 @@ def check_wiring():
     for text, needle, what in expect:
         if needle not in text:
             problems.append(f'missing: {what} ({needle})')
+    if code(os.path.join(SRC, 'ml_stun.c')).count('ml_net_io_wake(ml);') != 2:
+        problems.append('creating the IPv4 or IPv6 STUN socket should wake net_io\'s select()')
     if derp.count('derp_wait_work(ml, 1000)') != 1 or derp.count('derp_wait_work(ml, 100)') != 1:
         problems.append('the DERP task should wait in derp_wait_work(): up to 1 s connected, 100 ms not')
     if re.search(r'COORD_LONG_POLL.*?vTaskDelay\(\s*pdMS_TO_TICKS\(\s*50\s*\)\s*\)\s*;\s*\}\s*break;', coord, re.S):

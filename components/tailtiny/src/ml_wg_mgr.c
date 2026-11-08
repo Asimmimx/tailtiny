@@ -1762,7 +1762,9 @@ void ml_wg_mgr_task(void *arg) {
             if (ml->wg_netif && last_wg_periodic_ms + 400 < due) due = last_wg_periodic_ms + 400;
             uint32_t wait_ms = due > t ? (uint32_t)(due - t) : 0;
             if (wait_ms > 1000) wait_ms = 1000;
-            ulTaskNotifyTake(pdTRUE, wait_ms ? ML_DELAY_TICKS(wait_ms) : 0);
+            /* Rounded up to whole ticks: rounding down woke the task up to a
+             * tick before the job was due, only to wait again. */
+            ulTaskNotifyTake(pdTRUE, wait_ms ? pdMS_TO_TICKS(wait_ms + portTICK_PERIOD_MS - 1) : 0);
         }
     }
 
