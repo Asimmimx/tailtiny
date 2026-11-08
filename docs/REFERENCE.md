@@ -490,6 +490,7 @@ TailTiny Configuration
 | `ML_PRIORITY_PEER_IP` | Empty | Priority peer VPN IP (e.g., `100.x.y.z`). Guaranteed a WG slot even when peer table is full — LRU non-priority peer is evicted. Also settable via web UI. |
 | `ML_H2_BUFFER_SIZE_KB` | `512` with PSRAM, `80` without | Largest MapResponse accepted (64-2048 KB). The buffer is allocated at the response's actual size, so this is a cap, not a reservation. Rough guide: 64 KB ≈ 30 peers, 512 KB ≈ 300 peers, 2048 KB ≈ 1200 peers. |
 | `ML_JSON_BUFFER_SIZE_KB` | `512` with PSRAM, `64` without | Kept for compatibility. The initial MapResponse no longer uses a separate JSON buffer. |
+| `ML_TASK_DERP_CORE` | `0` | Core the DERP task runs on (0 or 1; dual-core chips only). Its TLS handshake to the relay took about 3 s of CPU on an ESP32-S3, at priority 5, and a lower-priority task on the same core waits that long at every DERP connect: one product's UI froze for 2.6-2.9 s on core 0, and 257 ms at most with this set to `1`. It moves the wait to core 1's lower-priority tasks rather than removing it. |
 | `ML_DERP_VERIFY_CERT` | `y` | Check the DERP relay's TLS certificate against ESP-IDF's certificate bundle and the relay's host name. Needs `MBEDTLS_CERTIFICATE_BUNDLE` (on by default). Costs about 70 KB of flash with the full bundle, or 21 KB with `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN`. Turn it off only for a self-hosted DERP server whose certificate the bundle doesn't know. A refused certificate is logged as `DERP certificate for <host> not accepted: <reason>`. |
 
 #### Credentials

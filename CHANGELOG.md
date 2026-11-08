@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New options
+
+- **`CONFIG_ML_TASK_DERP_CORE`: the core for the DERP task** (0 or 1, default 0, so nothing changes unless set). The DERP relay's TLS handshake took about 3 s of CPU on an ESP32-S3, at priority 5 on core 0, and a lower-priority task there can't run during it: in one product whose UI loop runs on core 0 at priority 1, the screen froze for 2.6 to 2.9 s at every DERP connect. With the option set to 1 the longest stall around the connect was 257 ms, and the handshake took 3.0 to 3.8 s in the background. This moves the contention to core 1, where lower-priority tasks wait instead. Single-core targets always use core 0.
+
 ### Power
 
 - **The coord and net_io tasks wait for work too, and no task wakes every 100 ms.** With the DERP and WireGuard tasks waiting since 3.1.0, the coord task still checked the control connection for 50 ms and then slept 50 ms, and the net_io task's `select()` timed out every 50 ms: about 30 wake-ups a second between them, so the chip seldom stayed idle long enough to sleep. The coord task's long-poll now waits in one `select()` on the control connection and an eventfd, which STUN replies, commands, a DERP region change and `tailtiny_stop()` write. The net_io task's `select()` includes its own eventfd, which `tailtiny_rebind()` and `tailtiny_stop()` write. Both wait up to 1 s, enough for the H2 PING every 5 s and the STUN retries every 2 s. The DERP task waits up to 1 s while connected (still 100 ms while reconnecting), and the WireGuard task until its next timer is due (every 400 ms, unchanged, since that's where a handshake an outgoing packet asks for is sent) instead of every 100 ms. On an ESP32-S3 idle on the tailnet, time in light sleep went from about 13% to about 33%. Each task falls back to its old polling on its own if its eventfd can't be created, with `CONFIG_VFS_SUPPORT_SELECT` off, and on a cellular AT socket. `tests/host/check_idle_wait.py` checks the new wiring.

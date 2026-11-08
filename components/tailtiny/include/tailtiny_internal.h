@@ -6,8 +6,8 @@
  * No shared mutable state between tasks - each owns its data exclusively.
  *
  * Tasks:
- *   net_io   (Core 0, pri 6)  - Unified select() on all sockets
- *   derp_tx  (Core 0, pri 7)  - Sole DERP TLS writer
+ *   net_io   (Core 0, pri 7)  - Unified select() on all sockets
+ *   derp_tx  (Core 0, pri 5)  - Sole DERP TLS writer (CONFIG_ML_TASK_DERP_CORE)
  *   coord    (Core 1, pri 5)  - Control plane (Noise, HTTP/2, registration)
  *   wg_mgr   (Core 1, pri 7)  - WireGuard + DISCO + peer management
  *   app      (unpinned, pri 3) - User application (external, not ours)
@@ -58,13 +58,21 @@ extern "C" {
 #define ML_TASK_APP_CORE        1
 #endif
 
+/* The DERP task: core 0 unless CONFIG_ML_TASK_DERP_CORE says otherwise
+ * (Kconfig: keep the relay's TLS handshake off an app's core). */
+#if defined(CONFIG_FREERTOS_UNICORE) || !defined(CONFIG_ML_TASK_DERP_CORE)
+#define ML_TASK_DERP_CORE       0
+#else
+#define ML_TASK_DERP_CORE       CONFIG_ML_TASK_DERP_CORE
+#endif
+
 #define ML_TASK_NET_IO_STACK    (8 * 1024)
 #define ML_TASK_NET_IO_PRIO     7
 #define ML_TASK_NET_IO_CORE     0
 
 #define ML_TASK_DERP_TX_STACK   (14 * 1024)
 #define ML_TASK_DERP_TX_PRIO    5
-#define ML_TASK_DERP_TX_CORE    0
+#define ML_TASK_DERP_TX_CORE    ML_TASK_DERP_CORE
 
 #define ML_TASK_COORD_STACK     (12 * 1024)
 #define ML_TASK_COORD_PRIO      5
