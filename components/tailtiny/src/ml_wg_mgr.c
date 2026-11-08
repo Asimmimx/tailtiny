@@ -420,6 +420,38 @@ static int find_peer_by_disco_key(tailtiny_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+/* Whether an update for a peer we already have changes nothing that matters:
+ * the same VPN address, DISCO key, home DERP region and endpoints, and it is
+ * already in wireguard-lwip. (Peers loaded from the NVS cache at boot aren't
+ * yet.) */
+static bool peer_update_unchanged(const ml_peer_t *p, const ml_peer_update_t *u) {
+    if (p->wg_peer_index < 0 || p->vpn_ip != u->vpn_ip || p->derp_region != u->derp_region ||
+        memcmp(p->disco_key, u->disco_key, 32) != 0 ||
+        p->endpoint_count != u->endpoint_count) {
+        return false;
+    }
+    for (int i = 0; i < u->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+        if (p->endpoints[i].ip != u->endpoints[i].ip ||
+            p->endpoints[i].port != u->endpoints[i].port ||
+            p->endpoints[i].is_ipv6 != u->endpoints[i].is_ipv6) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void notify_peer(tailtiny_t *ml, const ml_peer_t *p) {
+    if (!ml->peer_cb) return;
+    tailtiny_peer_info_t info = {
+        .vpn_ip = p->vpn_ip,
+        .online = p->online,
+        .direct_path = p->has_direct_path,
+    };
+    strncpy(info.hostname, p->hostname, sizeof(info.hostname) - 1);
+    memcpy(info.public_key, p->public_key, 32);
+    ml->peer_cb(ml, &info, ml->peer_cb_data);
+}
+
 static int add_peer(tailtiny_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -430,6 +462,38 @@ static int add_peer(tailtiny_t *ml, const ml_peer_update_t *update) {
     /* Check if peer already exists */
     int idx = find_peer_by_key(ml, update->public_key);
     bool is_new = idx < 0;
+    if (idx >= 0 && peer_update_unchanged(&ml->peers[idx], update)) {
+        /* The control server resends peers that haven't changed (every
+         * long-poll update lists them all). Re-adding one reset its direct
+         * path, so traffic fell back to DERP until DISCO found the path again,
+         * and every peer sent a CallMeMaybe and a probe and rewrote the NVS
+         * peer table: about a second of the WireGuard task's time for a dozen
+         * peers, while packets for live sessions waited. Only what can change
+         * here (online, hostname) is taken. */
+        ml_peer_t *p = &ml->peers[idx];
+        bool changed = false;
+        if (update->online >= 0 && p->online != (update->online == 1)) {
+            p->online = update->online == 1;
+            changed = true;
+        }
+        if (strncmp(p->hostname, update->hostname, sizeof(p->hostname) - 1) != 0) {
+            strncpy(p->hostname, update->hostname, sizeof(p->hostname) - 1);
+            p->hostname[sizeof(p->hostname) - 1] = '\0';
+            changed = true;
+        }
+        /* Writes only if the stored entry differs: an endpoint patch
+         * (ML_PEER_UPDATE_ENDPOINT) changes the peer without saving it. */
+        ml_peer_nvs_save(p);
+        /* Still a CallMeMaybe on each update, as before: it retries a lost one
+         * and carries our endpoints after a rebind changed them. It's one small
+         * packet; the path state stays as it is. */
+        if (!ml_at_socket_is_ready()) {
+            disco_send_call_me_maybe(ml, idx);
+        }
+        ESP_LOGD(TAG, "Peer %s unchanged (idx=%d)", p->hostname, idx);
+        if (changed) notify_peer(ml, p);
+        return idx;
+    }
     if (idx >= 0) {
         ESP_LOGI(TAG, "Updating existing peer %s (idx=%d)", update->hostname, idx);
     } else {
@@ -483,6 +547,12 @@ static int add_peer(tailtiny_t *ml, const ml_peer_update_t *update) {
     }
 
     ml_peer_t *p = &ml->peers[idx];
+    if (!is_new && p->vpn_ip != update->vpn_ip && p->wg_peer_index >= 0 && ml->wg_netif) {
+        /* A new VPN address under the same key: wireguardif_add_peer() returns
+         * the existing peer as it is, allowed IP included, so remove it first
+         * and let the add below create it with the new address. */
+        wireguardif_remove_peer((struct netif *)ml->wg_netif, (u8_t)p->wg_peer_index);
+    }
     p->vpn_ip = update->vpn_ip;
     memcpy(p->public_key, update->public_key, 32);
     memcpy(p->disco_key, update->disco_key, 32);
@@ -625,17 +695,8 @@ static int add_peer(tailtiny_t *ml, const ml_peer_update_t *update) {
         }
     }
 
-    /* Notify app via callback */
-    if (ml->peer_cb) {
-        tailtiny_peer_info_t info = {
-            .vpn_ip = p->vpn_ip,
-            .online = p->online,
-            .direct_path = false,
-        };
-        strncpy(info.hostname, p->hostname, sizeof(info.hostname) - 1);
-        memcpy(info.public_key, p->public_key, 32);
-        ml->peer_cb(ml, &info, ml->peer_cb_data);
-    }
+    /* Notify app via callback (has_direct_path was just reset: false) */
+    notify_peer(ml, p);
 
     return idx;
 }
