@@ -346,8 +346,9 @@ tailtiny_t *tailtiny_init(const tailtiny_config_t *config) {
         ml->net_io_wake_fd = eventfd(0, 0);
     }
     if (ml->coord_wake_fd < 0 || ml->net_io_wake_fd < 0) {
-        ESP_LOGW(TAG, "No eventfd for the %s task: it polls, light sleep limited",
-                 ml->coord_wake_fd < 0 ? "coord" : "net_io");
+        ESP_LOGW(TAG, "No eventfd for the %s: it polls, light sleep limited",
+                 ml->coord_wake_fd < 0 && ml->net_io_wake_fd < 0 ? "coord and net_io tasks"
+                 : ml->coord_wake_fd < 0 ? "coord task" : "net_io task");
     }
 #else
     /* Without VFS select() an eventfd can't be waited on with the socket;
