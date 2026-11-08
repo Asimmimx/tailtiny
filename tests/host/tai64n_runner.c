@@ -14,7 +14,7 @@ int64_t esp_timer_get_time(void) { return fake_uptime_us; }
 int fake_gettimeofday(struct timeval *tv, void *tz) {
     (void)tz;
     tv->tv_sec = (time_t)fake_wall_s;
-    tv->tv_usec = (suseconds_t)fake_wall_us;
+    tv->tv_usec = (long)fake_wall_us;  /* suseconds_t is missing on MinGW */
     return 0;
 }
 
