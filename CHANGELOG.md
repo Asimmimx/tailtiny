@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- **WireGuard: a handshake after a reboot is no longer dropped.** The handshake initiation's timestamp (TAI64N) was the time since boot. A WireGuard peer drops an initiation whose timestamp isn't newer than the last one it accepted from that key (replay protection; wireguard-go logs `handshake replay`), and after a reboot the time since boot starts again near 0. So every initiation TailTiny sent after a reboot was dropped, and a session only came up once the peer started a handshake itself, or had forgotten the old timestamp. `wireguard_tai64n_now()` now uses the wall clock once it is set (an RTC, SNTP or the application, from 2020 on), and the time since boot only until then. It never goes backwards within a boot, also when SNTP steps the clock back. `tests/host/check_tai64n.py` checks it.
+
 ### Power
 
 - **The coord and net_io tasks wait for work too, and no task wakes every 100 ms.** With the DERP and WireGuard tasks waiting since 3.1.0, the coord task still checked the control connection for 50 ms and then slept 50 ms, and the net_io task's `select()` timed out every 50 ms: about 30 wake-ups a second between them, so the chip seldom stayed idle long enough to sleep. The coord task's long-poll now waits in one `select()` on the control connection and an eventfd, which STUN replies, commands, a DERP region change and `tailtiny_stop()` write. The net_io task's `select()` includes its own eventfd, which `tailtiny_rebind()` and `tailtiny_stop()` write. Both wait up to 1 s, enough for the H2 PING every 5 s and the STUN retries every 2 s. The DERP task waits up to 1 s while connected (still 100 ms while reconnecting), and the WireGuard task until its next timer is due (every 400 ms, unchanged, since that's where a handshake an outgoing packet asks for is sent) instead of every 100 ms. On an ESP32-S3 idle on the tailnet, time in light sleep went from about 13% to about 33%. Each task falls back to its old polling on its own if its eventfd can't be created, with `CONFIG_VFS_SUPPORT_SELECT` off, and on a cellular AT socket. `tests/host/check_idle_wait.py` checks the new wiring.
