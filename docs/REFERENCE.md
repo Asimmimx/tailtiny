@@ -318,6 +318,8 @@ tailtiny_stop(ml);
 tailtiny_destroy(ml);
 ```
 
+`tailtiny_stop()` returns once all four tasks have exited (usually about 100 ms) and waits at most 20 s. If one is still running then, it logs `Stop: tasks still running after 20 s` and `tailtiny_destroy()` leaks the instance rather than free memory that task still uses. `tailtiny_start()` can be called again on a stopped instance.
+
 ### Factory Reset
 
 ```c

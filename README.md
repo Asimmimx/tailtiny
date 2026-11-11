@@ -151,7 +151,7 @@ echo "hello" | nc -u 100.x.y.z 9000      # the example echoes it back
 
 ## What this fork fixes
 
-Compared with upstream v2.1.0 (latest release: [v3.1.0](https://github.com/Asimmimx/tailtiny/releases/tag/v3.1.0)). Every item was checked on real hardware. Unless an item says otherwise, the numbers are from an ESP32-C3 without PSRAM:
+Compared with upstream v2.1.0 (latest release: [v3.2.0](https://github.com/Asimmimx/tailtiny/releases/tag/v3.2.0)). Every item was checked on real hardware. Unless an item says otherwise, the numbers are from an ESP32-C3 without PSRAM:
 
 - **Runs on ESP32-C3/C6 and boards without PSRAM.** Upstream reboot-looped on single-core chips and ran out of memory without PSRAM.
 - **No more crash** when a packet arrives while a socket is opening ([#17](https://github.com/CamM2325/microlink/issues/17)).
@@ -167,7 +167,11 @@ Compared with upstream v2.1.0 (latest release: [v3.1.0](https://github.com/Asimm
 - **WireGuard keys are no longer used by two tasks at once.** A keepalive and a data packet could get the same nonce under the same key ([#1](https://github.com/Asimmimx/tailtiny/issues/1)). Checked on an ESP32-S3: 38 minutes of two-way traffic with no stall.
 - **The DERP relay's certificate is checked.** Before, anyone on the network path could pose as the relay. It's on by default (`CONFIG_ML_DERP_VERIFY_CERT`) and adds about 70 KB of flash. Checked on an ESP32-S3 against Tailscale's relays.
 - **Builds with ESP-IDF 6** (cJSON from the registry, the driver split, GCC 15, Mbed TLS 4). Checked on an ESP32-S3 built with ESP-IDF 6.1.
-- **Automatic light sleep works with TailTiny running.** On an ESP32-S3 idle on the tailnet, time in light sleep went from 0% to about 12% ([#12](https://github.com/Asimmimx/tailtiny/pull/12)), and to about 33% with the coord and net_io changes on `main` since ([#13](https://github.com/Asimmimx/tailtiny/pull/13), not released yet). Your project turns it on ([how](docs/REFERENCE.md#power-saving-automatic-light-sleep)); the examples don't.
+- **Automatic light sleep works with TailTiny running.** On an ESP32-S3 idle on the tailnet, time in light sleep went from 0% to about 12% ([#12](https://github.com/Asimmimx/tailtiny/pull/12)), and to about 33% with the coord and net_io waits in v3.2.0 ([#13](https://github.com/Asimmimx/tailtiny/pull/13)). Your project turns it on ([how](docs/REFERENCE.md#power-saving-automatic-light-sleep)); the examples don't.
+- **No more one-way tunnel to peers behind CGNAT** ([#18](https://github.com/CamM2325/microlink/issues/18), [#41](https://github.com/CamM2325/microlink/issues/41)). Replies went to an address the peer had advertised but couldn't be reached on; they now go over DERP until a direct path is confirmed. With direct UDP blocked and the peer sending first, 40 of 40 echoes came back, against none before.
+- **Removed peers go away.** Removals and small peer updates from the control server were never applied (they name peers by NodeID), so deleted nodes kept peer slots, also across reboots through the NVS cache.
+- **WireGuard handshakes behave like wireguard-go:** an unanswered one is dropped after 90 s instead of retried every 5 s forever, outgoing traffic starts one, a session that stops answering is renewed after 15 s, and a reboot without SNTP isn't refused as a replay any more.
+- **`tailtiny_stop()` is safe:** it waits for the tasks to exit (115 ms instead of a fixed 3 s) and frees the WireGuard device and the DERP session, which leaked on every restart.
 - **Easier setup:** one component folder, Windows builds, any chip, and a credentials file that actually gets read.
 
 Full list with before/after measurements, behaviour changes and what's still open: **[CHANGELOG.md](CHANGELOG.md)**.
