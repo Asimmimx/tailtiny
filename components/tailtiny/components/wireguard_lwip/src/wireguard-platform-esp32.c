@@ -19,6 +19,17 @@
  * Time Functions
  * ========================================================================== */
 
+/* Unix time minus uptime (us), from wireguard_set_time_hint(); 0 = none.
+ * Without SNTP or an RTC the timestamp fell back to uptime, which restarts at
+ * 0 on every boot, so after a reboot every initiation we sent was dropped as
+ * a replay until the peer initiated itself. */
+static volatile int64_t s_time_hint_offset_us = 0;
+
+void wireguard_set_time_hint(int64_t unix_seconds) {
+    if (unix_seconds < WG_WALL_CLOCK_VALID_AFTER) return;
+    s_time_hint_offset_us = unix_seconds * 1000000LL - esp_timer_get_time();
+}
+
 uint32_t wireguard_sys_now() {
     // Use lwIP's built-in time function
     return sys_now();
@@ -37,9 +48,14 @@ void wireguard_tai64n_now(uint8_t *output) {
     uint64_t seconds;
     uint32_t nanoseconds;
     gettimeofday(&tv, NULL);
+    int64_t hint = s_time_hint_offset_us;
     if (tv.tv_sec >= WG_WALL_CLOCK_VALID_AFTER) {
         seconds = (uint64_t)tv.tv_sec;
         nanoseconds = (uint32_t)tv.tv_usec * 1000;
+    } else if (hint != 0) {
+        uint64_t now_us = (uint64_t)(esp_timer_get_time() + hint);
+        seconds = now_us / 1000000ULL;
+        nanoseconds = (now_us % 1000000ULL) * 1000;
     } else {
         uint64_t now_us = esp_timer_get_time();
         seconds = now_us / 1000000ULL;
@@ -114,4 +130,8 @@ void wireguard_platform_lock(void *lock) {
 
 void wireguard_platform_unlock(void *lock) {
 	xSemaphoreGive((SemaphoreHandle_t)lock);
+}
+
+void wireguard_platform_lock_free(void *lock) {
+	if (lock) vSemaphoreDelete((SemaphoreHandle_t)lock);
 }

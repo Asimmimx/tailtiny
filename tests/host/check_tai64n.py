@@ -35,7 +35,8 @@ STUBS = {
     'freertos/semphr.h': ('typedef void *SemaphoreHandle_t;\n'
                           'static inline SemaphoreHandle_t xSemaphoreCreateMutex(void) { return 0; }\n'
                           'static inline int xSemaphoreTake(SemaphoreHandle_t s, unsigned t) { (void)s; (void)t; return 1; }\n'
-                          'static inline int xSemaphoreGive(SemaphoreHandle_t s) { (void)s; return 1; }\n'),
+                          'static inline int xSemaphoreGive(SemaphoreHandle_t s) { (void)s; return 1; }\n'
+                          'static inline void vSemaphoreDelete(SemaphoreHandle_t s) { (void)s; }\n'),
 }
 
 WALL = 1_794_000_000  # a set clock (2026)
@@ -89,7 +90,15 @@ def check(exe):
     same = boot(exe, [(WALL, 0, 1), (WALL, 0, 2)])
     expect(same[0] < same[1], f'two timestamps in the same microsecond still differ: {same}')
 
-    print(f'tai64n: {6 - len(problems)}/6 checks passed')
+    # No SNTP or RTC: the control server's ControlTime (wireguard_set_time_hint)
+    hinted = boot(exe, [(-1, WALL, 5_000_000), (5, 0, 7_000_000)])
+    expect(hinted == [(TAI_LABEL + WALL + 2, 0)], f'an unset clock follows the time hint: got {hinted}')
+    last_before = boot(exe, [(-1, WALL, 3_000_000), (5, 0, 3600_000_000)])[-1]
+    first_after = boot(exe, [(-1, WALL + 3610, 6_000_000), (5, 0, 8_000_000)])[0]
+    expect(first_after > last_before,
+           f'with the hint and no clock, a reboot still moves forward: {first_after} vs {last_before}')
+
+    print(f'tai64n: {8 - len(problems)}/8 checks passed')
     return problems
 
 

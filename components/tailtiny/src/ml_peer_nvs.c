@@ -236,6 +236,20 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
     return loaded;
 }
 
+/* Drops a peer the control plane no longer lists, so the next boot doesn't
+ * preload it into one of the few peer slots. */
+esp_err_t ml_peer_nvs_remove(const uint8_t *public_key) {
+    if (!s_initialized || !public_key || !s_table) return ESP_ERR_INVALID_STATE;
+    for (int i = 0; i < s_table->count; i++) {
+        if (memcmp(s_table->entries[i].public_key, public_key, 32) == 0) {
+            s_table->entries[i] = s_table->entries[s_table->count - 1];
+            s_table->count--;
+            return flush_table();
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
 esp_err_t ml_peer_nvs_clear(void) {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 

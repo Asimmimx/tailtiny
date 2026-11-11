@@ -360,6 +360,8 @@ tailtiny_t *tailtiny_init(const tailtiny_config_t *config) {
     return ml;
 }
 
+static void ml_task_mark(tailtiny_t *ml, uint32_t bit);
+
 esp_err_t tailtiny_start(tailtiny_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
     if (ml->state != ML_STATE_IDLE) {
@@ -430,34 +432,45 @@ skip_bsd_socket:
     ;
 #endif
 
-    /* Create tasks */
+    /* Create tasks. A stop before this one left the shutdown bit set, and
+     * every task started now would have exited at once. */
+    xEventGroupClearBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    ml->stop_incomplete = false;
     BaseType_t ret;
 
+    ml_task_mark(ml, ML_TASK_BIT_NET_IO);
     ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
                                    ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create net_io task");
+        ml_task_exit(ml, ML_TASK_BIT_NET_IO);
         return ESP_FAIL;
     }
 
+    ml_task_mark(ml, ML_TASK_BIT_DERP);
     ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
                                    ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create derp_tx task");
+        ml_task_exit(ml, ML_TASK_BIT_DERP);
         return ESP_FAIL;
     }
 
+    ml_task_mark(ml, ML_TASK_BIT_COORD);
     ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
                                    ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create coord task");
+        ml_task_exit(ml, ML_TASK_BIT_COORD);
         return ESP_FAIL;
     }
 
+    ml_task_mark(ml, ML_TASK_BIT_WG_MGR);
     ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
                                    ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create wg_mgr task");
+        ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
         return ESP_FAIL;
     }
 
@@ -571,6 +584,20 @@ rebind_wg_update:
     return ESP_OK;
 }
 
+static portMUX_TYPE s_tasks_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void ml_task_mark(tailtiny_t *ml, uint32_t bit) {
+    taskENTER_CRITICAL(&s_tasks_lock);
+    ml->tasks_alive |= bit;
+    taskEXIT_CRITICAL(&s_tasks_lock);
+}
+
+void ml_task_exit(tailtiny_t *ml, uint32_t bit) {
+    taskENTER_CRITICAL(&s_tasks_lock);
+    ml->tasks_alive &= ~bit;
+    taskEXIT_CRITICAL(&s_tasks_lock);
+}
+
 esp_err_t tailtiny_stop(tailtiny_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 
@@ -580,13 +607,28 @@ esp_err_t tailtiny_stop(tailtiny_t *ml) {
     ml_coord_wake(ml);
     ml_net_io_wake(ml);
     ml_wg_notify(ml);
+    /* The coord task's reconnect backoff waits on its command queue */
+    ml_coord_cmd_t disc = ML_CMD_DISCONNECT;
+    ml_coord_queue_send(ml, ml->coord_cmd_queue, &disc, 0);
 
-    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
-     * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
-     * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* Wait until every task has exited (each clears its bit last, then calls
+     * vTaskDelete(NULL), so we must not delete them). This was a fixed 3 s
+     * sleep: a task still inside a reconnect backoff (up to 16 s), the wait
+     * for DERP (15 s), a DERP region probe or a TLS handshake ran on into
+     * the queues and the instance tailtiny_destroy() had freed by then. */
+    uint64_t wait_start = ml_get_time_ms();
+    while (ml->tasks_alive && ml_get_time_ms() - wait_start < ML_STOP_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    uint32_t left = ml->tasks_alive;
+    if (left) {
+        ESP_LOGE(TAG, "Stop: tasks still running after %d s (mask 0x%lx); the instance won't be freed",
+                 ML_STOP_TIMEOUT_MS / 1000, (unsigned long)left);
+        ml->stop_incomplete = true;
+    } else {
+        ESP_LOGI(TAG, "Stop: all tasks exited in %llu ms",
+                 (unsigned long long)(ml_get_time_ms() - wait_start));
+    }
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;
@@ -617,6 +659,12 @@ void tailtiny_destroy(tailtiny_t *ml) {
     if (!ml) return;
 
     tailtiny_stop(ml);
+    if (ml->stop_incomplete) {
+        /* A task still uses the instance and its queues: leaking them beats
+         * the crash freeing them would cause. */
+        ESP_LOGE(TAG, "Destroy: a task is still running, leaking the instance");
+        return;
+    }
 
     /* Deinitialize peer NVS */
     ml_peer_nvs_deinit();

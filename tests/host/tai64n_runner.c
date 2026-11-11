@@ -22,6 +22,11 @@ int fake_gettimeofday(struct timeval *tv, void *tz) {
 
 int main(void) {
     while (scanf("%lld %lld %lld", &fake_wall_s, &fake_wall_us, &fake_uptime_us) == 3) {
+        if (fake_wall_s < 0) {
+            /* "-1 <unix s> <uptime us>": the control server's time arrives */
+            wireguard_set_time_hint(fake_wall_us);
+            continue;
+        }
         uint8_t out[12];
         wireguard_tai64n_now(out);
         for (int i = 0; i < 12; i++) printf("%02x", out[i]);
