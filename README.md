@@ -1,9 +1,30 @@
 # TailTiny: Tailscale for ESP32
 
+[![Release](https://img.shields.io/github/v/release/Asimmimx/tailtiny)](https://github.com/Asimmimx/tailtiny/releases/latest)
+[![CI](https://github.com/Asimmimx/tailtiny/actions/workflows/ci.yml/badge.svg)](https://github.com/Asimmimx/tailtiny/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/asimmirzac)
+
 Put an ESP32 on your [Tailscale](https://tailscale.com) network. Once it's on your tailnet, any of your devices can reach it from anywhere: phone, laptop, server. You don't need port forwarding or a public IP.
 
-> TailTiny is a maintained fork of [MicroLink](https://github.com/CamM2325/microlink) (renamed in v3.0.0), which has had no commits since March 2026.
-> It adds bug fixes, plus easier setup and ESP32-C3 support. Every fix was tested on real hardware ([what changed](#what-this-fork-fixes)).
+TailTiny is an ESP-IDF component, tested on a $3 ESP32-C3 board without PSRAM. It's a fork of [MicroLink](https://github.com/CamM2325/microlink) by Cameron Malone, renamed in v3.0.0, and focuses on small boards, low power and a quick setup.
+
+> TailTiny is unofficial and not affiliated with Tailscale Inc. It works with Tailscale's hosted control server.
+
+---
+
+## TailTiny or MicroLink?
+
+MicroLink became active again in November 2026 ([v2.3.0](https://github.com/CamM2325/microlink/releases)) and took in several of TailTiny's fixes; TailTiny 3.3.0 in turn has the security fixes from MicroLink's audit that apply to its code. Both are good choices; pick by what you need:
+
+| | [MicroLink](https://github.com/CamM2325/microlink) | TailTiny |
+|---|---|---|
+| Best for | ESP32-S3 with PSRAM; 4G/LTE, Ethernet, subnet router and exit node, firmware updates over the tailnet | ESP32-C3/C6 and boards **without PSRAM**; automatic light sleep; setup in about 15 minutes, or by an AI assistant ([AGENTS.md](AGENTS.md)) |
+| Tested on | ESP32-S3 + PSRAM (WiFi and 4G) | ESP32-C3 without PSRAM, on every release |
+| Control servers | Tailscale, Headscale, Ionscale | Tailscale |
+| Install | [ESP Component Registry](https://components.espressif.com/components/camm2325/microlink) | `git clone` (below) |
+
+Using ESPHome? Have a look at [esphome-tailscale](https://github.com/Csontikka/esphome-tailscale).
 
 ---
 
@@ -151,7 +172,9 @@ echo "hello" | nc -u 100.x.y.z 9000      # the example echoes it back
 
 ## What this fork fixes
 
-Compared with upstream v2.1.0 (latest release: [v3.2.0](https://github.com/Asimmimx/tailtiny/releases/tag/v3.2.0)). Every item was checked on real hardware. Unless an item says otherwise, the numbers are from an ESP32-C3 without PSRAM:
+Compared with MicroLink v2.1.0, the version TailTiny was forked from (latest TailTiny release: [v3.3.0](https://github.com/Asimmimx/tailtiny/releases/tag/v3.3.0)). MicroLink v2.3.0 has since fixed many of the same problems, some of them with TailTiny's fixes. Unless an item says otherwise, it was checked on an ESP32-C3 without PSRAM, and the numbers are from there:
+
+- **Security fixes from MicroLink's and other forks' audits (v3.3.0).** A forged WireGuard cookie reply or DISCO pong could redirect a peer's traffic; a tailnet peer could crash the device by naming a tailnet address as its endpoint; anyone who could send to the device's UDP port could keep it busy with DISCO key derivations or set the public address it advertises through a fake STUN reply. The optional config web UI now needs a password and only answers on the tailnet address. Details: [CHANGELOG](CHANGELOG.md#v330-2026-11-19).
 
 - **Runs on ESP32-C3/C6 and boards without PSRAM.** Upstream reboot-looped on single-core chips and ran out of memory without PSRAM.
 - **No more crash** when a packet arrives while a socket is opening ([#17](https://github.com/CamM2325/microlink/issues/17)).
@@ -188,6 +211,7 @@ Full list with before/after measurements, behaviour changes and what's still ope
 | `Failed to resolve component 'wireguard_lwip'` | You're on the old upstream repo. Use this fork |
 | `DERP connect attempt N failed, retrying in ...` | Outbound HTTPS (port 443) is blocked or the internet is down. It keeps retrying by itself |
 | `DERP certificate for ... not accepted: ...` | Your DERP server's certificate isn't in ESP-IDF's certificate bundle (for example, a self-hosted relay with a private certificate). Add its CA to the bundle, or turn off `CONFIG_ML_DERP_VERIFY_CERT` |
+| Config web UI asks for a login, or answers `403` / `400` | Since v3.3.0 it needs a password (user `admin`; the password is printed in the boot log as `Config UI login: ...`, or set `CONFIG_ML_CONFIG_HTTPD_PASSWORD`). Open it at `http://100.x.y.z/` from a tailnet device, by IP address, not by name |
 
 More in the [full reference](docs/REFERENCE.md#troubleshooting).
 
@@ -195,9 +219,22 @@ More in the [full reference](docs/REFERENCE.md#troubleshooting).
 
 ## More documentation
 
-- [Full reference](docs/REFERENCE.md): features, memory, API, every config option, cellular (4G), headscale
+- [Full reference](docs/REFERENCE.md): features, memory, API, every config option, cellular (4G), the config web UI
 - [Architecture](docs/ARCHITECTURE.md) · [Large tailnets](docs/LARGE_TAILNET.md) · [Testing guide](TESTING_GUIDE.md)
+- [Security policy](SECURITY.md): how to report a vulnerability privately
+
+## Support
+
+The most useful help is a report: an [issue](https://github.com/Asimmimx/tailtiny/issues) with your chip and what happened, especially from boards not tested yet (ESP32-C6, S3, classic ESP32). If TailTiny saved you an afternoon and you'd like to say thanks, you can [buy me a coffee](https://buymeacoffee.com/asimmirzac). It's free and MIT-licensed either way.
 
 ## Credits & license
 
-TailTiny is based on MicroLink, created by **Cameron Malone** ([CamM2325](https://github.com/CamM2325)). This fork keeps his work and adds fixes on top. MIT License, see [LICENSE](LICENSE).
+TailTiny is based on MicroLink, created by **Cameron Malone** ([CamM2325](https://github.com/CamM2325)). This fork keeps his work and adds fixes on top.
+
+Thanks also to:
+
+- [tozes](https://github.com/tozes), for the idle-power, ESP-IDF 6 and WireGuard locking work.
+- The MicroLink forks whose fixes are credited in the [CHANGELOG](CHANGELOG.md): Csontikka, fugo101, espkvm, antmanler, jetkvm, cplewes and djorr5.
+- Tomasz Fiedoruk, for the WireGuard roaming test that `tests/host/check_wg_roaming.py` is adapted from.
+
+MIT License, see [LICENSE](LICENSE). Bundled third-party code (wireguard-lwip, BSD-3-Clause; X25519, MIT) and trademark notes: [NOTICE.md](NOTICE.md).
