@@ -225,6 +225,12 @@ typedef struct {
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
 #define ML_EVT_DERP_REGION_CHANGED  BIT9    /* tell the control plane our new PreferredDERP */
 
+/* Every bit above: tailtiny_start() clears them all. Add new bits here too. */
+#define ML_EVT_ALL  (ML_EVT_WIFI_CONNECTED | ML_EVT_COORD_REGISTERED | ML_EVT_DERP_CONNECTED | \
+                     ML_EVT_WG_READY | ML_EVT_PEERS_AVAILABLE | ML_EVT_STUN_COMPLETE | \
+                     ML_EVT_SHUTDOWN_REQUEST | ML_EVT_DERP_RECONNECT | ML_EVT_DERP_CONNECT_REQ | \
+                     ML_EVT_DERP_REGION_CHANGED)
+
 /* ============================================================================
  * Queue Message Types
  * ========================================================================== */
@@ -413,7 +419,8 @@ struct tailtiny_s {
     TaskHandle_t wg_mgr_task;
     int wg_notifiers;                  /* producers inside ml_wg_notify(), under ml_wg_task_lock */
     volatile uint32_t tasks_alive;     /* ML_TASK_BIT_*: set by tailtiny_start(), cleared by ml_task_exit() */
-    bool stop_incomplete;              /* a task outlived tailtiny_stop(): destroy must not free */
+    bool stop_incomplete;              /* a task outlived tailtiny_stop(): start refuses, destroy must not free,
+                                          until a later stop sees every task gone */
 
     /* Queues */
     int derp_wake_fd;                  /* eventfd: wakes select for queued TX/control work */
@@ -677,7 +684,8 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers);
 esp_err_t ml_peer_nvs_clear(void);
 esp_err_t ml_peer_nvs_remove(const uint8_t *public_key);
 
-/* tailtiny.c: a task's last touch of the instance, right before vTaskDelete(NULL) */
+/* tailtiny.c: a task's last touch of the instance, right before vTaskDelete(NULL).
+ * Also clears the task's handle (wg_mgr clears its own, under its notify lock). */
 #define ML_TASK_BIT_NET_IO  (1u << 0)
 #define ML_TASK_BIT_DERP    (1u << 1)
 #define ML_TASK_BIT_COORD   (1u << 2)

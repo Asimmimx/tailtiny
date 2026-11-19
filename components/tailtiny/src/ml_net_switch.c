@@ -7,6 +7,10 @@
  *   2. If WiFi fails → tear down WiFi, init cellular, start TailTiny over cellular
  *   3. Periodic health check → if VPN drops, trigger switch
  *   4. When on cellular, periodically check if WiFi has recovered → failback
+ *
+ * The switch task owns the TailTiny handle and the transports: it creates,
+ * stops and destroys them, also when ml_net_switch_stop() is called, which
+ * waits for it.
  */
 
 #include "sdkconfig.h"
@@ -25,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/timers.h"
 #include <string.h>
 
@@ -38,6 +43,35 @@ static const char *TAG = "ml_net_sw";
 #define WIFI_FAIL_BIT       BIT1
 #define NET_SW_STACK_SIZE   6144
 #define WIFI_DISCONNECT_DEBOUNCE_MS  5000  /* Wait 5s before declaring WiFi dead */
+
+/* Defaults for the ml_net_switch_config_t timing fields left at 0: Kconfig
+ * "Network Switching" (CONFIG_ML_NET_SWITCH_*), which was never read. The
+ * fallbacks are the Kconfig defaults. The WiFi timeout and the health-check
+ * period can't be 0 (Kconfig has no range): 0 there means the old default. */
+#ifndef CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS
+#define CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS    30000
+#endif
+#ifndef CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS
+#define CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS 30000
+#endif
+#ifndef CONFIG_ML_NET_SWITCH_FAILBACK_MS
+#define CONFIG_ML_NET_SWITCH_FAILBACK_MS        120000
+#endif
+#define NET_SW_DEFAULT_WIFI_TIMEOUT_MS \
+    (CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS > 0 ? CONFIG_ML_NET_SWITCH_WIFI_TIMEOUT_MS : 30000)
+#define NET_SW_DEFAULT_HEALTH_INTERVAL_MS \
+    (CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS > 0 ? CONFIG_ML_NET_SWITCH_HEALTH_INTERVAL_MS : 30000)
+#define NET_SW_DEFAULT_FAILBACK_MS \
+    (CONFIG_ML_NET_SWITCH_FAILBACK_MS > 0 ? CONFIG_ML_NET_SWITCH_FAILBACK_MS : 0)  /* 0 = no failback */
+
+/* Backoff between full attempts after WiFi and cellular both failed */
+#define NET_SW_RETRY_MIN_MS     30000
+#define NET_SW_RETRY_MAX_MS     300000
+
+/* How long ml_net_switch_stop() waits for the task to tear down and exit.
+ * The task may be in a modem power-up or network registration that can't
+ * be cut short, and then in tailtiny_stop()'s own wait. */
+#define NET_SW_STOP_TIMEOUT_MS  300000
 
 typedef struct {
     /* Config (copied) */
@@ -64,12 +98,11 @@ typedef struct {
     /* State */
     ml_net_switch_state_t state;
     ml_net_type_t active_transport;
-    tailtiny_t *ml;
+    tailtiny_t *ml;             /* written only by the switch task, under s_ml_lock */
     bool initialized;
-    bool running;
+    volatile bool running;      /* cleared by ml_net_switch_stop(); the task polls it */
 
     /* WiFi */
-    esp_netif_t *wifi_netif;
     EventGroupHandle_t wifi_events;
     int wifi_retry_count;
 
@@ -90,6 +123,58 @@ typedef struct {
 
 static ml_net_switch_ctx_t s_ctx = {0};
 
+/* The default WiFi STA netif and the WiFi/IP event handlers are process-wide
+ * and outlive a deinit. In s_ctx, deinit's memset forgot them, and an init
+ * after it created a second STA netif and registered the handlers again. */
+static esp_netif_t *s_wifi_netif;
+
+/* Guards s_ctx.ml: the health timer and ml_net_switch_get_handle() read it
+ * while the switch task may be replacing it. Static: no allocation, and it
+ * survives deinit/init. */
+static SemaphoreHandle_t s_ml_lock;
+static StaticSemaphore_t s_ml_lock_buf;
+
+/* NS_TASK_EXITED is set while no switch task exists: the task sets it as
+ * the last thing it does, start clears it before creating one, and stop waits
+ * for it without clearing it. Sticky, unlike a semaphore given once: a give
+ * left over from a stop that timed out could end a later stop before the new
+ * task had exited, and of two concurrent stops only one got it. */
+#define NS_TASK_EXITED BIT0
+static EventGroupHandle_t s_task_events;
+static StaticEventGroup_t s_task_events_buf;
+
+/* Notifies of the task in flight (timer callbacks, stop), under s_task_lock.
+ * The task clears its handle and waits for them before deleting itself, so
+ * a notify that read the handle just before can't reach a deleted task.
+ * Same scheme as ml_wg_notify(). */
+static portMUX_TYPE s_task_lock = portMUX_INITIALIZER_UNLOCKED;
+static int s_notifiers;
+
+static void sw_notify_task(void)
+{
+    taskENTER_CRITICAL(&s_task_lock);
+    TaskHandle_t task = s_ctx.task_handle;
+    if (task) s_notifiers++;
+    taskEXIT_CRITICAL(&s_task_lock);
+    if (!task) return;
+    xTaskNotifyGive(task);
+    taskENTER_CRITICAL(&s_task_lock);
+    s_notifiers--;
+    taskEXIT_CRITICAL(&s_task_lock);
+}
+
+/* Sleep that ends early once ml_net_switch_stop() was called. Returns
+ * whether the switch is still running. Leaves task notifications alone. */
+static bool sw_sleep(uint32_t ms)
+{
+    while (ms > 0 && s_ctx.running) {
+        uint32_t slice = ms > 250 ? 250 : ms;
+        vTaskDelay(pdMS_TO_TICKS(slice));
+        ms -= slice;
+    }
+    return s_ctx.running;
+}
+
 /* ============================================================================
  * WiFi Management
  * ========================================================================== */
@@ -107,9 +192,7 @@ static void wifi_debounce_cb(TimerHandle_t timer)
     ESP_LOGW(TAG, "WiFi down for %dms — triggering switch to cellular",
              WIFI_DISCONNECT_DEBOUNCE_MS);
     s_ctx.state = ML_NET_SW_SWITCHING_TO_CELL;
-    if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-    }
+    sw_notify_task();
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -160,8 +243,8 @@ static esp_err_t wifi_start(void)
     s_ctx.wifi_retry_count = 0;
     xEventGroupClearBits(s_ctx.wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
-    if (!s_ctx.wifi_netif) {
-        s_ctx.wifi_netif = esp_netif_create_default_wifi_sta();
+    if (!s_wifi_netif) {
+        s_wifi_netif = esp_netif_create_default_wifi_sta();
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -180,16 +263,20 @@ static esp_err_t wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-    /* Wait for connection */
-    EventBits_t bits = xEventGroupWaitBits(s_ctx.wifi_events,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE, pdFALSE,
-                                            pdMS_TO_TICKS(s_ctx.wifi_timeout_ms));
+    /* Wait for connection, in slices so that a stop is noticed */
+    EventBits_t bits = 0;
+    for (uint32_t waited = 0; waited < s_ctx.wifi_timeout_ms && s_ctx.running; waited += 250) {
+        bits = xEventGroupWaitBits(s_ctx.wifi_events,
+                                   WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(250));
+        if (bits & (WIFI_CONNECTED_BIT | WIFI_FAIL_BIT)) break;
+    }
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected");
         return ESP_OK;
     }
+    if (!s_ctx.running) return ESP_ERR_INVALID_STATE;  /* stop requested */
 
     ESP_LOGW(TAG, "WiFi connection failed (timeout=%lums)", (unsigned long)s_ctx.wifi_timeout_ms);
     return ESP_ERR_TIMEOUT;
@@ -267,6 +354,21 @@ static void cellular_stop(void)
  * TailTiny VPN Management
  * ========================================================================== */
 
+/* Unpublish the handle, then stop and destroy it. Only the switch task calls
+ * this, so a handle can't be stopped and destroyed twice. */
+static void vpn_stop(void)
+{
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    tailtiny_t *ml = s_ctx.ml;
+    s_ctx.ml = NULL;
+    xSemaphoreGive(s_ml_lock);
+
+    if (ml) {
+        tailtiny_stop(ml);
+        tailtiny_destroy(ml);
+    }
+}
+
 static esp_err_t vpn_start(void)
 {
     const char *name = s_ctx.device_name[0] ? s_ctx.device_name : NULL;
@@ -288,17 +390,19 @@ static esp_err_t vpn_start(void)
         .max_peers = CONFIG_ML_MAX_PEERS,
     };
 
-    s_ctx.ml = tailtiny_init(&ml_config);
-    if (!s_ctx.ml) {
+    tailtiny_t *ml = tailtiny_init(&ml_config);
+    if (!ml) {
         ESP_LOGE(TAG, "tailtiny_init failed");
         return ESP_FAIL;
     }
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    s_ctx.ml = ml;
+    xSemaphoreGive(s_ml_lock);
 
-    esp_err_t err = tailtiny_start(s_ctx.ml);
+    esp_err_t err = tailtiny_start(ml);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "tailtiny_start failed: %s", esp_err_to_name(err));
-        tailtiny_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
+        vpn_stop();
         return err;
     }
 
@@ -308,8 +412,13 @@ static esp_err_t vpn_start(void)
     int timeout_ticks = (s_ctx.active_transport == ML_NET_WIFI) ? 120 : 360;
     int timeout_secs = timeout_ticks / 2;
     for (int i = 0; i < timeout_ticks; i++) {
-        if (tailtiny_is_connected(s_ctx.ml)) {
-            uint32_t ip = tailtiny_get_vpn_ip(s_ctx.ml);
+        if (!s_ctx.running) {
+            ESP_LOGI(TAG, "Stop requested while waiting for the VPN");
+            vpn_stop();
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (tailtiny_is_connected(ml)) {
+            uint32_t ip = tailtiny_get_vpn_ip(ml);
             char ip_str[16];
             tailtiny_ip_to_str(ip, ip_str);
             ESP_LOGI(TAG, "VPN connected via %s (IP: %s)",
@@ -321,19 +430,8 @@ static esp_err_t vpn_start(void)
     }
 
     ESP_LOGW(TAG, "VPN connection timeout (%ds)", timeout_secs);
-    tailtiny_stop(s_ctx.ml);
-    tailtiny_destroy(s_ctx.ml);
-    s_ctx.ml = NULL;
+    vpn_stop();
     return ESP_ERR_TIMEOUT;
-}
-
-static void vpn_stop(void)
-{
-    if (s_ctx.ml) {
-        tailtiny_stop(s_ctx.ml);
-        tailtiny_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
-    }
 }
 
 /* ============================================================================
@@ -342,9 +440,18 @@ static void vpn_stop(void)
 
 static void health_timer_cb(TimerHandle_t timer)
 {
-    if (!s_ctx.running || !s_ctx.ml) return;
+    if (!s_ctx.running) return;
 
-    if (!tailtiny_is_connected(s_ctx.ml)) {
+    /* On the timer task: never block. If the switch task holds the lock it
+     * is replacing the handle; skip this round. Read without the lock, the
+     * handle could be destroyed in between. */
+    if (!s_ml_lock || xSemaphoreTake(s_ml_lock, 0) != pdTRUE) return;
+    bool have_ml = s_ctx.ml != NULL;
+    bool connected = have_ml && tailtiny_is_connected(s_ctx.ml);
+    xSemaphoreGive(s_ml_lock);
+    if (!have_ml) return;
+
+    if (!connected) {
         s_ctx.health_fail_counter++;
         ESP_LOGW(TAG, "Health check failed (%lu/%lu)",
                  (unsigned long)s_ctx.health_fail_counter,
@@ -361,9 +468,7 @@ static void health_timer_cb(TimerHandle_t timer)
             }
 
             /* Wake the task */
-            if (s_ctx.task_handle) {
-                xTaskNotifyGive(s_ctx.task_handle);
-            }
+            sw_notify_task();
         }
     } else {
         s_ctx.health_fail_counter = 0;
@@ -385,51 +490,46 @@ static void failback_timer_cb(TimerHandle_t timer)
     ESP_LOGI(TAG, "Failback check: attempting WiFi reconnection...");
     s_ctx.state = ML_NET_SW_SWITCHING_TO_WIFI;
 
-    if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-    }
+    sw_notify_task();
 }
 
 /* ============================================================================
  * Main State Machine Task
  * ========================================================================== */
 
-static void net_switch_task(void *arg)
+/* Bring the VPN up over WiFi. On failure WiFi is stopped again. */
+static bool try_wifi(void)
 {
-    ESP_LOGI(TAG, "Network switch task started");
-
-    /* Step 1: Try WiFi (skip if no SSID configured) */
-    bool has_wifi = (s_ctx.wifi_ssid[0] != '\0');
-
-    if (!has_wifi) {
-        ESP_LOGI(TAG, "No WiFi SSID configured, going straight to cellular");
-        goto try_cellular;
-    }
-
     s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
     s_ctx.active_transport = ML_NET_WIFI;
 
-    esp_err_t err = wifi_start();
-    if (err == ESP_OK) {
-        /* WiFi connected, start VPN */
-        err = vpn_start();
-        if (err == ESP_OK) {
-            s_ctx.state = ML_NET_SW_WIFI_VPN_UP;
-            if (s_ctx.on_connected) {
-                s_ctx.on_connected(ML_NET_WIFI, s_ctx.user_data);
-            }
-            /* Start health check timer */
-            xTimerStart(s_ctx.health_timer, 0);
-            goto state_loop;
+    if (wifi_start() == ESP_OK && s_ctx.running && vpn_start() == ESP_OK) {
+        s_ctx.state = ML_NET_SW_WIFI_VPN_UP;
+        if (s_ctx.on_connected) {
+            s_ctx.on_connected(ML_NET_WIFI, s_ctx.user_data);
         }
+        /* Start health check timer */
+        xTimerStart(s_ctx.health_timer, 0);
+        return true;
     }
 
     /* WiFi failed — try cellular */
-    ESP_LOGW(TAG, "WiFi path failed, falling back to cellular");
+    if (s_ctx.running) {
+        ESP_LOGW(TAG, "WiFi path failed, falling back to cellular");
+    }
     wifi_stop();
-    goto try_cellular;
+    return false;
+}
 
-try_cellular:
+/* Bring the VPN up over cellular. On failure the modem may still be up: the
+ * caller stops it before the next attempt. */
+static bool try_cellular(void)
+{
+    /* The failback timer would turn the state into SWITCHING_TO_WIFI while
+     * this attempt runs */
+    xTimerStop(s_ctx.health_timer, 0);
+    if (s_ctx.failback_timer) xTimerStop(s_ctx.failback_timer, 0);
+
     s_ctx.state = ML_NET_SW_CELL_CONNECTING;
     s_ctx.active_transport = ML_NET_CELLULAR;
 
@@ -437,40 +537,30 @@ try_cellular:
         s_ctx.on_switching(ML_NET_WIFI, ML_NET_CELLULAR, s_ctx.user_data);
     }
 
-    err = cellular_start();
-    if (err == ESP_OK) {
-        err = vpn_start();
-        if (err == ESP_OK) {
-            s_ctx.state = ML_NET_SW_CELL_VPN_UP;
-            if (s_ctx.on_connected) {
-                s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
-            }
-            /* Start health check + failback timers */
-            xTimerStart(s_ctx.health_timer, 0);
-            if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
-                xTimerStart(s_ctx.failback_timer, 0);
-            }
-            goto state_loop;
+    if (cellular_start() == ESP_OK && s_ctx.running && vpn_start() == ESP_OK) {
+        s_ctx.state = ML_NET_SW_CELL_VPN_UP;
+        if (s_ctx.on_connected) {
+            s_ctx.on_connected(ML_NET_CELLULAR, s_ctx.user_data);
         }
+        /* Start health check + failback timers */
+        xTimerStart(s_ctx.health_timer, 0);
+        if (s_ctx.failback_check_ms > 0 && s_ctx.failback_timer) {
+            xTimerStart(s_ctx.failback_timer, 0);
+        }
+        return true;
     }
+    return false;
+}
 
-    /* Both failed */
-    ESP_LOGE(TAG, "Both WiFi and cellular failed!");
-    s_ctx.state = ML_NET_SW_ERROR;
-    if (s_ctx.on_disconnected) {
-        s_ctx.on_disconnected(s_ctx.user_data);
-    }
+typedef enum {
+    SW_LOOP_STOPPED,        /* ml_net_switch_stop() was called */
+    SW_LOOP_RETRY_CELL,     /* the VPN couldn't be moved: start again on cellular */
+} sw_loop_result_t;
 
-    /* Retry after 30s */
-    vTaskDelay(pdMS_TO_TICKS(30000));
-    if (s_ctx.running) {
-        cellular_stop();
-        s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
-        s_ctx.active_transport = ML_NET_WIFI;
-        /* Fall through to state_loop which will handle reconnection */
-    }
-
-state_loop:
+/* Runs while the VPN is up: reacts to the health, failback and debounce
+ * timers. */
+static sw_loop_result_t state_loop(void)
+{
     while (s_ctx.running) {
         /* Wait for notification from health/failback timer */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
@@ -489,6 +579,7 @@ state_loop:
                 /* Start cellular while WiFi VPN is still running */
                 s_ctx.state = ML_NET_SW_CELL_CONNECTING;
                 esp_err_t cell_err = cellular_start();
+                if (!s_ctx.running) break;  /* stop: the task's teardown takes it from here */
                 if (cell_err == ESP_OK) {
                     /* Cellular is up — rebind sockets instead of full restart */
                     wifi_stop();
@@ -509,7 +600,10 @@ state_loop:
                                  esp_err_to_name(rb_err));
                         vpn_stop();
                         wifi_stop();
-                        goto try_cellular;
+                        /* The modem is up: the retry initialises it again
+                         * (it failed on "Already initialized" before) */
+                        cellular_stop();
+                        return SW_LOOP_RETRY_CELL;
                     }
                 } else {
                     /* Cellular failed — full restart path */
@@ -519,7 +613,7 @@ state_loop:
                     }
                     vpn_stop();
                     wifi_stop();
-                    goto try_cellular;
+                    return SW_LOOP_RETRY_CELL;
                 }
                 break;
             }
@@ -535,6 +629,7 @@ state_loop:
                 s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
 
                 esp_err_t wifi_err = wifi_start();
+                if (!s_ctx.running) break;  /* stop: the task's teardown takes it from here */
                 if (wifi_err == ESP_OK) {
                     /* WiFi is back — rebind sockets to WiFi interface */
                     ESP_LOGI(TAG, "WiFi recovered! Rebinding to WiFi");
@@ -562,7 +657,7 @@ state_loop:
                                  esp_err_to_name(rb_err));
                         wifi_stop();
                         vpn_stop();
-                        goto try_cellular;
+                        return SW_LOOP_RETRY_CELL;
                     }
                 } else {
                     /* WiFi still down, stay on cellular */
@@ -581,9 +676,81 @@ state_loop:
                 break;
         }
     }
+    return SW_LOOP_STOPPED;
+}
+
+static void net_switch_task(void *arg)
+{
+    ESP_LOGI(TAG, "Network switch task started");
+
+    /* Step 1: Try WiFi (skip if no SSID configured) */
+    bool has_wifi = (s_ctx.wifi_ssid[0] != '\0');
+    bool cellular_only_next = false;
+    uint32_t retry_ms = NET_SW_RETRY_MIN_MS;
+
+    /* Every failure comes back here. After WiFi and cellular had both failed
+     * once, the task slept 30 s and went into the state loop with no VPN and
+     * no timer running, in a state the loop doesn't handle: offline until a
+     * reboot. Now it starts over, WiFi then cellular, with a backoff. */
+    while (s_ctx.running) {
+        bool up = false;
+
+        if (!has_wifi) {
+            ESP_LOGI(TAG, "No WiFi SSID configured, going straight to cellular");
+        } else if (!cellular_only_next) {
+            up = try_wifi();
+        }
+        cellular_only_next = false;
+
+        if (!up && s_ctx.running) {
+            up = try_cellular();
+        }
+
+        if (up) {
+            retry_ms = NET_SW_RETRY_MIN_MS;
+            if (state_loop() == SW_LOOP_RETRY_CELL) {
+                cellular_only_next = true;
+            }
+            continue;
+        }
+
+        if (!s_ctx.running) break;
+
+        /* Both failed */
+        ESP_LOGE(TAG, "Both WiFi and cellular failed! Retrying in %lus",
+                 (unsigned long)(retry_ms / 1000));
+        s_ctx.state = ML_NET_SW_ERROR;
+        if (s_ctx.on_disconnected) {
+            s_ctx.on_disconnected(s_ctx.user_data);
+        }
+
+        sw_sleep(retry_ms);
+        retry_ms = (retry_ms * 2 > NET_SW_RETRY_MAX_MS) ? NET_SW_RETRY_MAX_MS : retry_ms * 2;
+        cellular_stop();
+    }
+
+    /* Teardown, here: this task owns the handle and the transports.
+     * TailTiny first, so its tasks have exited before their transport goes. */
+    ESP_LOGI(TAG, "Network switch task stopping");
+    xTimerStop(s_ctx.health_timer, 0);
+    if (s_ctx.failback_timer) xTimerStop(s_ctx.failback_timer, 0);
+    vpn_stop();
+    if (has_wifi) wifi_stop();
+    cellular_stop();
+    s_ctx.state = ML_NET_SW_IDLE;
 
     ESP_LOGI(TAG, "Network switch task exiting");
+    taskENTER_CRITICAL(&s_task_lock);
     s_ctx.task_handle = NULL;
+    taskEXIT_CRITICAL(&s_task_lock);
+    for (;;) {
+        taskENTER_CRITICAL(&s_task_lock);
+        int busy = s_notifiers;
+        taskEXIT_CRITICAL(&s_task_lock);
+        if (!busy) break;
+        vTaskDelay(1);
+    }
+    xEventGroupSetBits(s_task_events, NS_TASK_EXITED);
     vTaskDelete(NULL);
 }
 
@@ -598,6 +765,12 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
 
     memset(&s_ctx, 0, sizeof(s_ctx));
 
+    if (!s_ml_lock) s_ml_lock = xSemaphoreCreateMutexStatic(&s_ml_lock_buf);
+    if (!s_task_events) {
+        s_task_events = xEventGroupCreateStatic(&s_task_events_buf);
+        xEventGroupSetBits(s_task_events, NS_TASK_EXITED);   /* no task yet */
+    }
+
     /* Copy strings */
     if (config->wifi_ssid) strncpy(s_ctx.wifi_ssid, config->wifi_ssid, sizeof(s_ctx.wifi_ssid) - 1);
     if (config->wifi_password) strncpy(s_ctx.wifi_password, config->wifi_password, sizeof(s_ctx.wifi_password) - 1);
@@ -606,11 +779,14 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
     strncpy(s_ctx.tailscale_auth_key, config->tailscale_auth_key, sizeof(s_ctx.tailscale_auth_key) - 1);
     if (config->device_name) strncpy(s_ctx.device_name, config->device_name, sizeof(s_ctx.device_name) - 1);
 
-    /* Timing defaults */
-    s_ctx.wifi_timeout_ms = config->wifi_timeout_ms ? config->wifi_timeout_ms : 30000;
-    s_ctx.health_check_interval_ms = config->health_check_interval_ms ? config->health_check_interval_ms : 30000;
+    /* Timing defaults (Kconfig "Network Switching" for the _ms fields) */
+    s_ctx.wifi_timeout_ms = config->wifi_timeout_ms ? config->wifi_timeout_ms
+                                                    : NET_SW_DEFAULT_WIFI_TIMEOUT_MS;
+    s_ctx.health_check_interval_ms = config->health_check_interval_ms ? config->health_check_interval_ms
+                                                                      : NET_SW_DEFAULT_HEALTH_INTERVAL_MS;
     s_ctx.health_fail_count = config->health_fail_count ? config->health_fail_count : 3;
-    s_ctx.failback_check_ms = config->failback_check_ms ? config->failback_check_ms : 120000;
+    s_ctx.failback_check_ms = config->failback_check_ms ? config->failback_check_ms
+                                                        : NET_SW_DEFAULT_FAILBACK_MS;
 
     /* Callbacks */
     s_ctx.on_connected = config->on_connected;
@@ -655,7 +831,12 @@ void ml_net_switch_deinit(void)
 {
     if (!s_ctx.initialized) return;
 
-    ml_net_switch_stop();
+    if (ml_net_switch_stop() != ESP_OK) {
+        /* The task still runs and uses the timers, the event group and
+         * s_ctx: freeing them now would pull them out from under it. */
+        ESP_LOGE(TAG, "Deinit skipped: the network switch task hasn't exited");
+        return;
+    }
 
     if (s_ctx.health_timer) {
         xTimerDelete(s_ctx.health_timer, portMAX_DELAY);
@@ -676,14 +857,20 @@ void ml_net_switch_deinit(void)
 esp_err_t ml_net_switch_start(void)
 {
     if (!s_ctx.initialized) return ESP_ERR_INVALID_STATE;
-    if (s_ctx.running) return ESP_ERR_INVALID_STATE;
+    if (s_ctx.running || s_ctx.task_handle) return ESP_ERR_INVALID_STATE;
+    /* Also not while the last task is still on its way out (after a stop
+     * that timed out): call ml_net_switch_stop() again first */
+    if (!(xEventGroupGetBits(s_task_events) & NS_TASK_EXITED)) return ESP_ERR_INVALID_STATE;
 
+    xEventGroupClearBits(s_task_events, NS_TASK_EXITED);
     s_ctx.running = true;
 
     BaseType_t ret = xTaskCreate(net_switch_task, "net_sw",
                                   NET_SW_STACK_SIZE, NULL, 5, &s_ctx.task_handle);
     if (ret != pdPASS) {
         s_ctx.running = false;
+        s_ctx.task_handle = NULL;
+        xEventGroupSetBits(s_task_events, NS_TASK_EXITED);
         return ESP_ERR_NO_MEM;
     }
 
@@ -692,7 +879,16 @@ esp_err_t ml_net_switch_start(void)
 
 esp_err_t ml_net_switch_stop(void)
 {
-    if (!s_ctx.running) return ESP_OK;
+    if (!s_ctx.running && !s_ctx.task_handle &&
+        (!s_task_events || (xEventGroupGetBits(s_task_events) & NS_TASK_EXITED))) {
+        return ESP_OK;
+    }
+
+    if (s_ctx.task_handle && xTaskGetCurrentTaskHandle() == s_ctx.task_handle) {
+        /* From an on_* callback: the task can't wait for itself */
+        ESP_LOGE(TAG, "ml_net_switch_stop() called from the switch task (a callback?)");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_ctx.running = false;
 
@@ -702,20 +898,18 @@ esp_err_t ml_net_switch_stop(void)
     if (s_ctx.wifi_debounce_timer) xTimerStop(s_ctx.wifi_debounce_timer, portMAX_DELAY);
     s_ctx.wifi_disconnect_pending = false;
 
-    /* Wake task so it exits */
-    if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-        /* Wait for task to exit */
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    /* Tear down connections */
-    vpn_stop();
-
-    if (s_ctx.active_transport == ML_NET_WIFI) {
-        wifi_stop();
-    } else {
-        cellular_stop();
+    /* The task tears down TailTiny and the transports itself on its way out:
+     * wake it and wait. This waited a fixed 500 ms and then ran vpn_stop()
+     * here, while the task could still be in vpn_start() (which waits up to
+     * 180 s), cellular_start() or wifi_start(): both then stopped and
+     * destroyed the same handle, or the task used it after it was freed. */
+    sw_notify_task();
+    EventBits_t bits = xEventGroupWaitBits(s_task_events, NS_TASK_EXITED, pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(NET_SW_STOP_TIMEOUT_MS));
+    if (!(bits & NS_TASK_EXITED)) {
+        ESP_LOGE(TAG, "Network switch task didn't exit within %ds; call ml_net_switch_stop() again",
+                 NET_SW_STOP_TIMEOUT_MS / 1000);
+        return ESP_ERR_TIMEOUT;
     }
 
     s_ctx.state = ML_NET_SW_IDLE;
@@ -734,7 +928,11 @@ ml_net_switch_state_t ml_net_switch_get_state(void)
 
 tailtiny_t *ml_net_switch_get_handle(void)
 {
-    return s_ctx.ml;
+    if (!s_ml_lock) return NULL;
+    xSemaphoreTake(s_ml_lock, portMAX_DELAY);
+    tailtiny_t *ml = s_ctx.ml;
+    xSemaphoreGive(s_ml_lock);
+    return ml;
 }
 
 const char *ml_net_switch_state_str(ml_net_switch_state_t state)

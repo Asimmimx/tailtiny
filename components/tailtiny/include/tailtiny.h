@@ -97,10 +97,16 @@ tailtiny_t *tailtiny_init(const tailtiny_config_t *config);
 /**
  * @brief Start connecting to Tailscale
  * @param ml Handle from tailtiny_init()
- * @return ESP_OK on success
+ * @return ESP_OK on success,
+ *         ESP_ERR_INVALID_STATE if already started, or if a task of the last
+ *         run outlived tailtiny_stop() (call tailtiny_stop() again first),
+ *         ESP_FAIL if a task couldn't be created (the tasks already created
+ *         are stopped again, and start can be retried)
  *
  * WiFi must be connected before calling this.
  * Connection proceeds asynchronously - use callbacks or poll state.
+ * Can be called again after tailtiny_stop() returned ESP_OK; the new run
+ * starts like the first one (no peers, no VPN IP until registered again).
  */
 esp_err_t tailtiny_start(tailtiny_t *ml);
 
@@ -125,15 +131,26 @@ esp_err_t tailtiny_rebind(tailtiny_t *ml);
 /**
  * @brief Stop and disconnect from Tailscale
  * @param ml Handle
- * @return ESP_OK on success
+ * @return ESP_OK once every internal task has exited and what the run held
+ *         (sockets, queued packets, the peer table, the VPN IP) is released;
+ *         ESP_ERR_TIMEOUT if a task was still running after 20 s: nothing is
+ *         released, the state is ML_STATE_ERROR, tailtiny_start() refuses
+ *         the handle, and calling tailtiny_stop() again waits again;
+ *         ESP_ERR_INVALID_STATE if called from a TailTiny task (a state or
+ *         peer callback), which can't wait for itself to exit
  *
- * Gracefully shuts down all tasks and closes connections.
+ * Gracefully shuts down all tasks and closes connections. The config web
+ * UI is stopped first. Safe to call when already stopped.
  */
 esp_err_t tailtiny_stop(tailtiny_t *ml);
 
 /**
  * @brief Destroy TailTiny instance and free all resources
  * @param ml Handle (NULL-safe)
+ *
+ * Calls tailtiny_stop(). If a task is still running after that, the instance
+ * is leaked rather than freed under it. Called from a TailTiny task, it does
+ * nothing. Either way, don't use the handle afterwards.
  */
 void tailtiny_destroy(tailtiny_t *ml);
 
@@ -168,12 +185,13 @@ int tailtiny_get_peer_count(const tailtiny_t *ml);
 esp_err_t tailtiny_get_peer_info(const tailtiny_t *ml, int index, tailtiny_peer_info_t *info);
 
 /**
- * @brief Send UDP data to a peer by VPN IP
- * @param ml Handle
- * @param dest_vpn_ip Destination VPN IP (host byte order)
- * @param data Payload
- * @param len Payload length (max 1400 bytes)
- * @return ESP_OK on success, ESP_ERR_TIMEOUT if send queue full
+ * @brief Not supported: always returns ESP_ERR_NOT_SUPPORTED
+ * @return ESP_ERR_NOT_SUPPORTED (ESP_ERR_INVALID_ARG if ml is NULL)
+ *
+ * Earlier versions put the payload into a DERP relay packet unencrypted,
+ * outside WireGuard: the relay could read it and the peer discarded it.
+ * Use tailtiny_udp_create()/tailtiny_udp_send() or tailtiny_tcp_connect(),
+ * which go through the WireGuard tunnel.
  */
 esp_err_t tailtiny_send(tailtiny_t *ml, uint32_t dest_vpn_ip,
                           const uint8_t *data, size_t len);
@@ -259,6 +277,11 @@ tailtiny_udp_socket_t *tailtiny_udp_create(tailtiny_t *ml, uint16_t local_port);
 
 /**
  * @brief Close UDP socket and free resources
+ *
+ * Waits for a receive callback in progress to return (up to 5 s; after that
+ * the socket is freed when the callback returns), and the callback isn't
+ * called again. Can be called from inside the receive callback: the socket
+ * is then freed once the callback returns. Don't use the handle afterwards.
  */
 void tailtiny_udp_close(tailtiny_udp_socket_t *sock);
 

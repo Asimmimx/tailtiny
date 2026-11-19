@@ -19,26 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This project includes code from the following sources:
-
-## WireGuard
-WireGuard is a registered trademark of Jason A. Donenfeld.
-The WireGuard protocol implementation is based on the WireGuard specification.
-
-## X25519 Implementation
-The X25519 elliptic curve implementation is derived from public domain code
-by Daniel J. Bernstein. See x25519-license.txt for details.
-
-## Tailscale Protocol
-This implementation is based on reverse engineering of the Tailscale protocol.
-Tailscale is a trademark of Tailscale Inc. This project is not affiliated with
-or endorsed by Tailscale Inc.
-
----
-
-DISCLAIMER: This is an independent implementation created for educational and
-interoperability purposes. Use at your own risk. The authors make no guarantees
-about security, correctness, or compatibility with official Tailscale software.

@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch lwIP headers, Python packages
+        run: |
+          git clone --depth 1 --branch STABLE-2_2_0_RELEASE https://github.com/lwip-tcpip/lwip.git "$RUNNER_TEMP/lwip"
+          git clone --depth 1 --branch v1.7.18 https://github.com/DaveGamble/cJSON.git "$RUNNER_TEMP/cjson"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet cryptography
+      - name: Run
+        env:
+          LWIP_INCLUDE_DIR: ${{ runner.temp }}/lwip/src/include
+          CJSON_DIR: ${{ runner.temp }}/cjson
+        run: |
+          py="$RUNNER_TEMP/venv/bin/python"
+          for t in run_tests check_wg_locking check_noise_aead check_idle_wait check_tai64n check_wg_roaming check_x25519 check_coord_robustness check_config_guard; do
+            echo "::group::$t"
+            "$py" "tests/host/$t.py"
+            echo "::endgroup::"
+          done
+
+  firmware:
+    name: ${{ matrix.example }} / ${{ matrix.target }} / IDF ${{ matrix.idf }}${{ matrix.variant && format(' / {0}', matrix.variant) || '' }}
+    runs-on: ubuntu-latest
+    container: espressif/idf:${{ matrix.idf }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every chip with WiFi that ESP-IDF 5.3 supports
+          - { idf: v5.3.2, example: basic_connect, target: esp32c3 }
+          - { idf: v5.3.2, example: basic_connect, target: esp32s3 }
+          - { idf: v5.3.2, example: basic_connect, target: esp32 }
+          - { idf: v5.3.2, example: basic_connect, target: esp32c6 }
+          - { idf: v5.3.2, example: basic_connect, target: esp32s2 }
+          - { idf: v5.3.2, example: basic_connect, target: esp32c2 }
+          # The other examples
+          - { idf: v5.3.2, example: cellular_connect, target: esp32s3 }
+          - { idf: v5.3.2, example: cellular_heartbeat, target: esp32s3 }
+          - { idf: v5.3.2, example: failover_connect, target: esp32s3 }
+          - { idf: v5.3.2, example: rebind_test, target: esp32s3 }
+          # The config web UI, which basic_connect leaves off
+          - { idf: v5.3.2, example: basic_connect, target: esp32c3, variant: config-ui }
+          # ESP-IDF 6 (mbedTLS 4, GCC 15)
+          - { idf: v6.1.1, example: basic_connect, target: esp32s3 }
+          - { idf: v6.1.1, example: basic_connect, target: esp32c3 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Config web UI on
+        if: matrix.variant == 'config-ui'
+        working-directory: examples/${{ matrix.example }}
+        run: printf '\nCONFIG_ML_ENABLE_CONFIG_HTTPD=y\n' >> sdkconfig.defaults
+      - name: Build
+        shell: bash
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          idf.py set-target ${{ matrix.target }}
+          idf.py build
+      - name: Size
+        if: success()
+        shell: bash
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          {
+            echo "### ${{ matrix.example }} / ${{ matrix.target }} / IDF ${{ matrix.idf }} ${{ matrix.variant }}"
+            echo '```'
+            idf.py size | tail -n 20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

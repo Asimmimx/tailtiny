@@ -11,6 +11,14 @@
  * On large tailnets (60+ peers), this prevents wg_mgr flooding and
  * reduces ping latency from 28-1400ms to consistent <100ms.
  *
+ * Every request needs HTTP Basic auth (user "admin", password from
+ * CONFIG_ML_CONFIG_HTTPD_PASSWORD or generated on first boot and printed
+ * on the serial console), is answered only on the device's own VPN address
+ * (plus the WiFi station / Ethernet address with
+ * CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN), and must name that address in its
+ * Host header. POST and DELETE requests must be Content-Type
+ * application/json.
+ *
  * Gated by CONFIG_ML_ENABLE_CONFIG_HTTPD in Kconfig.
  */
 
@@ -53,7 +61,9 @@ typedef struct __attribute__((packed)) {
     char     auth_key[96];          /* tskey-auth-... + null */
     char     device_prefix[32];     /* e.g. "sensor" → becomes "sensor-a1b2c3" */
     char     cellular_apn[32];
-    char     cellular_sim_pin[16];
+    char     cellular_sim_pin[16];  /* unused, kept for the blob layout; cleared
+                                     * on load. The SIM PIN comes from Kconfig
+                                     * (CONFIG_ML_CELLULAR_SIM_PIN) or the app. */
     uint8_t  flags;                 /* bit 0: reserved */
 
     /* --- v2 fields (appended, zero = use Kconfig default) --- */
@@ -120,7 +130,10 @@ ml_config_ctx_t *ml_config_httpd_init(void);
  * @return ESP_OK on success
  *
  * Call after tailtiny_start() when VPN IP is available.
- * Binds to port 80 on all interfaces.
+ * Listens on port 80 on all interfaces, but answers only on the VPN
+ * address (and the WiFi station / Ethernet address with
+ * CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN); every other address gets 403.
+ * Sets up the UI password and prints it once per boot if generated.
  */
 esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, struct tailtiny_s *ml);
 

@@ -73,6 +73,22 @@ struct wireguardif_peer {
 
 #define WIREGUARDIF_INVALID_INDEX (0xFF)
 
+// May a WireGuard (or DISCO) packet be sent straight to this IPv4 address?
+// ip is in network byte order, as ip4_addr_t holds it. Not the tailnet's own
+// range 100.64.0.0/10: the WireGuard netif is a /10, so a packet to it routes
+// back into this interface, and a peer that got such an address set as its
+// endpoint (by roaming, a DISCO pong or an advertised endpoint) made each send
+// re-enter wireguardif_output() until the stack overflowed. Nor 0.0.0.0/8,
+// loopback, link-local, multicast, 240/4 or broadcast.
+static inline bool wireguardif_endpoint_ip4_ok(u32_t ip_net_order) {
+	u32_t a = lwip_ntohl(ip_net_order);
+	if ((a & 0xFFC00000UL) == 0x64400000UL) return false;   // 100.64.0.0/10
+	if ((a >> 24) == 0 || (a >> 24) == 127) return false;   // 0/8, 127/8
+	if ((a & 0xFFFF0000UL) == 0xA9FE0000UL) return false;   // 169.254/16
+	if ((a >> 28) >= 0xE) return false;                       // 224/4, 240/4, broadcast
+	return true;
+}
+
 /* static struct netif wg_netif_struct = {0};
  * struct wireguard_interface wg;
  * wg.private_key = "abcdefxxx..xxxxx=";

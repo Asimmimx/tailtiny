@@ -67,6 +67,20 @@ static void load_table(void) {
     size_t len = sizeof(peer_nvs_table_t);
     if (nvs_get_blob(s_nvs, PEER_NVS_BLOB_KEY, s_table, &len) != ESP_OK) {
         memset(s_table, 0, sizeof(peer_nvs_table_t));
+        return;
+    }
+
+    /* flush_table() writes the header and exactly count entries. count was
+     * used as read, and every loop over the table runs to it: a blob that
+     * doesn't match (corrupt flash, or written by a build with another
+     * entry layout) had the loops read past the entries it holds, or past
+     * the table. It's only a cache: drop it, the peer list refills it. */
+    const size_t hdr = sizeof(uint16_t) * 2;
+    if (len < hdr || s_table->count > ML_NVS_MAX_PEERS ||
+        len != hdr + (size_t)s_table->count * sizeof(peer_nvs_entry_t)) {
+        ESP_LOGW(TAG, "Peer cache in NVS is inconsistent (%u bytes, %u entries), dropping it",
+                 (unsigned)len, (unsigned)(len >= hdr ? s_table->count : 0));
+        memset(s_table, 0, sizeof(peer_nvs_table_t));
     }
 }
 
@@ -217,9 +231,10 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
         memcpy(p->hostname, entry->hostname_short, sizeof(entry->hostname_short));
         p->hostname[sizeof(entry->hostname_short)] = '\0';
 
-        /* Restore endpoints */
-        p->endpoint_count = entry->endpoint_count;
-        for (int j = 0; j < entry->endpoint_count && j < 2; j++) {
+        /* Restore endpoints. At most 2 are stored; a larger count from a
+         * corrupt entry claimed endpoints that were never restored. */
+        p->endpoint_count = entry->endpoint_count < 2 ? entry->endpoint_count : 2;
+        for (int j = 0; j < p->endpoint_count; j++) {
             p->endpoints[j].ip = entry->endpoints[j].ip;
             p->endpoints[j].port = entry->endpoints[j].port;
             p->endpoints[j].is_ipv6 = false;

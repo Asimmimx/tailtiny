@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -39,14 +40,66 @@ static const char *TAG = "failover";
 static char wifi_ssid[33]     = CONFIG_ML_WIFI_SSID;
 static char wifi_password[65] = CONFIG_ML_WIFI_PASSWORD;
 
+/* The UDP socket belongs to one TailTiny handle, and net_switch destroys the
+ * handle and makes a new one when it restarts the VPN (connect timeout,
+ * failed rebind, both transports failed). The example used to fetch the
+ * handle and create the socket once, and after such a restart sent on a
+ * freed handle. net_switch calls on_switching or on_disconnected before it
+ * destroys a handle it announced, so the socket is closed there, and the
+ * main loop creates it again after on_connected, once the VPN is up (right
+ * after a rebind it is still reconnecting). s_sock_lock keeps the main loop
+ * off the socket while a callback closes it. */
+static SemaphoreHandle_t s_sock_lock;
+static tailtiny_udp_socket_t *s_sock;
+static bool s_vpn_up;   /* between on_connected and on_switching/on_disconnected */
+static uint64_t s_sock_retry_ms;    /* next try after a failed create */
+
+static void sock_close(void)
+{
+    xSemaphoreTake(s_sock_lock, portMAX_DELAY);
+    s_vpn_up = false;
+    if (s_sock) {
+        tailtiny_udp_close(s_sock);
+        s_sock = NULL;
+    }
+    xSemaphoreGive(s_sock_lock);
+}
+
+/* Main loop, with s_sock_lock held */
+static void sock_open_locked(void)
+{
+    if (s_sock || !s_vpn_up) return;
+    uint64_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (now < s_sock_retry_ms) return;
+    /* While s_vpn_up is set under the lock, net_switch can't be destroying
+     * this handle: it would first wait in sock_close() for the lock. */
+    tailtiny_t *ml = ml_net_switch_get_handle();
+    if (!ml || !tailtiny_is_connected(ml)) return;
+    s_sock = tailtiny_udp_create(ml, UDP_PORT);
+    if (!s_sock) {
+        ESP_LOGE(TAG, "Failed to create UDP socket, retrying in 5 s");
+        s_sock_retry_ms = now + 5000;
+        return;
+    }
+    char ip_str[16];
+    tailtiny_ip_to_str(tailtiny_get_vpn_ip(ml), ip_str);
+    ESP_LOGI(TAG, "Ready: %s:%d via %s",
+             ip_str, UDP_PORT,
+             ml_net_switch_get_active() == ML_NET_WIFI ? "WiFi" : "Cellular");
+}
+
 static void on_connected(ml_net_type_t type, void *user_data)
 {
     ESP_LOGI(TAG, "=== CONNECTED via %s ===", type == ML_NET_WIFI ? "WiFi" : "Cellular");
+    xSemaphoreTake(s_sock_lock, portMAX_DELAY);
+    s_vpn_up = true;
+    xSemaphoreGive(s_sock_lock);
 }
 
 static void on_disconnected(void *user_data)
 {
     ESP_LOGW(TAG, "=== DISCONNECTED ===");
+    sock_close();
 }
 
 static void on_switching(ml_net_type_t from, ml_net_type_t to, void *user_data)
@@ -54,6 +107,7 @@ static void on_switching(ml_net_type_t from, ml_net_type_t to, void *user_data)
     ESP_LOGW(TAG, "=== SWITCHING: %s -> %s ===",
              from == ML_NET_WIFI ? "WiFi" : "Cellular",
              to == ML_NET_WIFI ? "WiFi" : "Cellular");
+    sock_close();
 }
 
 void app_main(void)
@@ -101,31 +155,23 @@ void app_main(void)
         .on_switching = on_switching,
     };
 
+    s_sock_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_sock_lock ? ESP_OK : ESP_ERR_NO_MEM);
+
     ESP_ERROR_CHECK(ml_net_switch_init(&config));
     ESP_ERROR_CHECK(ml_net_switch_start());
 
-    /* Wait for VPN connection */
+    /* Wait for VPN connection (on_connected). The handle isn't read here: it
+     * can be destroyed between fetching it and using it. */
     ESP_LOGI(TAG, "Waiting for VPN connection...");
-    while (!ml_net_switch_get_handle() ||
-           !tailtiny_is_connected(ml_net_switch_get_handle())) {
+    for (;;) {
+        xSemaphoreTake(s_sock_lock, portMAX_DELAY);
+        bool up = s_vpn_up;
+        xSemaphoreGive(s_sock_lock);
+        if (up) break;
         vTaskDelay(pdMS_TO_TICKS(1000));
         ESP_LOGI(TAG, "  %s", ml_net_switch_state_str(ml_net_switch_get_state()));
     }
-
-    /* Create UDP socket */
-    tailtiny_t *ml = ml_net_switch_get_handle();
-    tailtiny_udp_socket_t *sock = tailtiny_udp_create(ml, UDP_PORT);
-    if (!sock) {
-        ESP_LOGE(TAG, "Failed to create UDP socket");
-        return;
-    }
-
-    uint32_t vpn_ip = tailtiny_get_vpn_ip(ml);
-    char ip_str[16];
-    tailtiny_ip_to_str(vpn_ip, ip_str);
-    ESP_LOGI(TAG, "Ready: %s:%d via %s",
-             ip_str, UDP_PORT,
-             ml_net_switch_get_active() == ML_NET_WIFI ? "WiFi" : "Cellular");
 
     uint32_t target_ip = 0;
 #ifdef CONFIG_ML_EXAMPLE_TARGET_PEER_IP
@@ -140,34 +186,41 @@ void app_main(void)
     while (1) {
         uint64_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* RX */
-        uint32_t src_ip;
-        uint16_t src_port;
-        uint8_t buf[256];
-        size_t len = sizeof(buf) - 1;
+        /* The socket is only used with s_sock_lock held (see sock_close) */
+        xSemaphoreTake(s_sock_lock, portMAX_DELAY);
+        sock_open_locked();
+        tailtiny_udp_socket_t *sock = s_sock;
+        if (sock) {
+            /* RX */
+            uint32_t src_ip;
+            uint16_t src_port;
+            uint8_t buf[256];
+            size_t len = sizeof(buf) - 1;
 
-        if (tailtiny_udp_recv(sock, &src_ip, &src_port, buf, &len, 0) == ESP_OK && len > 0) {
-            buf[len] = '\0';
-            char src[16];
-            tailtiny_ip_to_str(src_ip, src);
-            ESP_LOGI(TAG, "RX [%s:%u]: %s", src, src_port, buf);
-            rx_count++;
+            if (tailtiny_udp_recv(sock, &src_ip, &src_port, buf, &len, 0) == ESP_OK && len > 0) {
+                buf[len] = '\0';
+                char src[16];
+                tailtiny_ip_to_str(src_ip, src);
+                ESP_LOGI(TAG, "RX [%s:%u]: %s", src, src_port, buf);
+                rx_count++;
 
-            if (strncmp((char *)buf, "ping", 4) == 0) {
-                const char *pong = "pong";
-                tailtiny_udp_send(sock, src_ip, src_port, pong, strlen(pong));
+                if (strncmp((char *)buf, "ping", 4) == 0) {
+                    const char *pong = "pong";
+                    tailtiny_udp_send(sock, src_ip, src_port, pong, strlen(pong));
+                }
+            }
+
+            /* TX to target peer every 5s */
+            if (target_ip && (now - last_tx >= 5000)) {
+                last_tx = now;
+                char msg[80];
+                snprintf(msg, sizeof(msg), "failover-test #%lu via %s",
+                         (unsigned long)tx_count++,
+                         ml_net_switch_get_active() == ML_NET_WIFI ? "wifi" : "cell");
+                tailtiny_udp_send(sock, target_ip, UDP_PORT, msg, strlen(msg));
             }
         }
-
-        /* TX to target peer every 5s */
-        if (target_ip && (now - last_tx >= 5000)) {
-            last_tx = now;
-            char msg[80];
-            snprintf(msg, sizeof(msg), "failover-test #%lu via %s",
-                     (unsigned long)tx_count++,
-                     ml_net_switch_get_active() == ML_NET_WIFI ? "wifi" : "cell");
-            tailtiny_udp_send(sock, target_ip, UDP_PORT, msg, strlen(msg));
-        }
+        xSemaphoreGive(s_sock_lock);
 
         /* Status every 10s */
         if (now - last_status >= 10000) {

@@ -23,6 +23,7 @@
 
 #include "ml_at_socket.h"
 #include "ml_cellular.h"
+#include "ml_at_validate.h"
 #include "tailtiny_internal.h"
 
 #include "esp_log.h"
@@ -1298,6 +1299,17 @@ int ml_at_getaddrinfo(const char *hostname, const char *service,
      * The modem replies "OK" immediately, then sends "+CDNSGIP: 1,..." as a URC.
      * We use at_cmd_wait_urc() to keep reading until we see the result. */
     char cmd[256];
+
+    /* The name goes inside a quoted AT argument: anything but a plain
+     * host name (a '"' or CR/LF from a web-configured control host or a
+     * DERP map entry) could run any AT command. The length limit keeps
+     * the command whole in cmd. */
+    if (!ml_at_param_valid(ML_AT_PARAM_HOSTNAME, hostname,
+                           sizeof(cmd) - sizeof("AT+CDNSGIP=\"\""))) {
+        ESP_LOGW(TAG, "DNS: refusing invalid host name (%u bytes)",
+                 (unsigned)strnlen(hostname, 1024));
+        return EAI_NONAME;
+    }
     snprintf(cmd, sizeof(cmd), "AT+CDNSGIP=\"%s\"", hostname);
 
     ESP_LOGI(TAG, "DNS: resolving %s", hostname);

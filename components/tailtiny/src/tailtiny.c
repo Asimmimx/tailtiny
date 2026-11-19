@@ -160,6 +160,17 @@ esp_err_t tailtiny_factory_reset(void) {
         ESP_LOGI(TAG, "Factory reset: keys erased");
     }
 
+    /* Erase the settings saved by the config web UI (auth key, WiFi list,
+     * APN/PPP login, control host, UI password). They override Kconfig,
+     * so leaving them would let planted values survive a reset. */
+    err = nvs_open("ml_config", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_erase_all(nvs);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Factory reset: config UI settings erased");
+    }
+
     /* Erase cached peers */
     ml_peer_nvs_init();
     ml_peer_nvs_clear();
@@ -300,6 +311,10 @@ tailtiny_t *tailtiny_init(const tailtiny_config_t *config) {
     ml->events = xEventGroupCreate();
     if (!ml->events) {
         ESP_LOGE(TAG, "Failed to create event group");
+        /* Undo the config server and peer cache set up above: they leaked
+         * here. (tailtiny_destroy() needs the event group, so not that.) */
+        if (ml->config_httpd) ml_config_httpd_deinit(ml->config_httpd);
+        ml_peer_nvs_deinit();
         free(ml);
         return NULL;
     }
@@ -362,9 +377,25 @@ tailtiny_t *tailtiny_init(const tailtiny_config_t *config) {
 
 static void ml_task_mark(tailtiny_t *ml, uint32_t bit);
 
+/* A task couldn't be created. The ones created before it would run on with
+ * nobody to stop them: stop them (and close the DISCO socket) the way
+ * tailtiny_stop() does, so start can be tried again. */
+static esp_err_t ml_start_rollback(tailtiny_t *ml) {
+    tailtiny_stop(ml);
+    return ESP_FAIL;
+}
+
 esp_err_t tailtiny_start(tailtiny_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
-    if (ml->state != ML_STATE_IDLE) {
+    if (ml->stop_incomplete) {
+        /* A task of the last run outlived tailtiny_stop(). New tasks would
+         * run next to it on the same queues, sockets and task bits, and a
+         * later destroy would free the instance under it. */
+        ESP_LOGE(TAG, "Can't start: a task of the last run is still running (mask 0x%lx); "
+                      "call tailtiny_stop() again first", (unsigned long)ml->tasks_alive);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ml->state != ML_STATE_IDLE || ml->tasks_alive) {
         ESP_LOGW(TAG, "Already started (state=%d)", ml->state);
         return ESP_ERR_INVALID_STATE;
     }
@@ -432,10 +463,13 @@ skip_bsd_socket:
     ;
 #endif
 
-    /* Create tasks. A stop before this one left the shutdown bit set, and
-     * every task started now would have exited at once. */
-    xEventGroupClearBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
-    ml->stop_incomplete = false;
+    /* Create tasks. Every event bit is cleared first, not only the shutdown
+     * bit a stop left set (with it every new task exited at once): a
+     * COORD_REGISTERED, DERP_CONNECTED or WG_READY left from the last run
+     * let the new tasks skip their waits, so wg_mgr set up WireGuard before
+     * the new registration and coord stopped waiting for DERP before it had
+     * connected. */
+    xEventGroupClearBits(ml->events, ML_EVT_ALL);
     BaseType_t ret;
 
     ml_task_mark(ml, ML_TASK_BIT_NET_IO);
@@ -444,7 +478,7 @@ skip_bsd_socket:
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create net_io task");
         ml_task_exit(ml, ML_TASK_BIT_NET_IO);
-        return ESP_FAIL;
+        return ml_start_rollback(ml);
     }
 
     ml_task_mark(ml, ML_TASK_BIT_DERP);
@@ -453,7 +487,7 @@ skip_bsd_socket:
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create derp_tx task");
         ml_task_exit(ml, ML_TASK_BIT_DERP);
-        return ESP_FAIL;
+        return ml_start_rollback(ml);
     }
 
     ml_task_mark(ml, ML_TASK_BIT_COORD);
@@ -462,7 +496,7 @@ skip_bsd_socket:
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create coord task");
         ml_task_exit(ml, ML_TASK_BIT_COORD);
-        return ESP_FAIL;
+        return ml_start_rollback(ml);
     }
 
     ml_task_mark(ml, ML_TASK_BIT_WG_MGR);
@@ -471,7 +505,7 @@ skip_bsd_socket:
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create wg_mgr task");
         ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
-        return ESP_FAIL;
+        return ml_start_rollback(ml);
     }
 
     /* WiFi is expected to be connected before tailtiny_start() is called.
@@ -493,7 +527,8 @@ skip_bsd_socket:
 
 esp_err_t tailtiny_rebind(tailtiny_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
-    if (ml->state == ML_STATE_IDLE) return ESP_ERR_INVALID_STATE;
+    /* Not after a stop either, also one that timed out (ERROR) */
+    if (ml->state == ML_STATE_IDLE || ml->stop_incomplete) return ESP_ERR_INVALID_STATE;
 
     ESP_LOGI(TAG, "=== Rebinding to new network interface ===");
 
@@ -593,52 +628,166 @@ static void ml_task_mark(tailtiny_t *ml, uint32_t bit) {
 }
 
 void ml_task_exit(tailtiny_t *ml, uint32_t bit) {
+    /* Unpublish the handle before the task is deleted: the config UI's
+     * /api/monitor calls eTaskGetState() on these, and tailtiny_stop()
+     * compares them with the calling task. wg_mgr_exit() has already
+     * cleared the WireGuard task's own handle, under its notify lock. */
+    if (bit & ML_TASK_BIT_NET_IO) ml->net_io_task = NULL;
+    if (bit & ML_TASK_BIT_DERP) ml->derp_tx_task = NULL;
+    if (bit & ML_TASK_BIT_COORD) ml->coord_task = NULL;
     taskENTER_CRITICAL(&s_tasks_lock);
     ml->tasks_alive &= ~bit;
     taskEXIT_CRITICAL(&s_tasks_lock);
 }
 
+/* How long stop lets the coord task notice the shutdown bit by itself before
+ * it shuts down the control connection under it, and how often it looks for
+ * a new connection after that. */
+#define ML_STOP_GRACE_MS        1000
+#define ML_STOP_UNBLOCK_MS      2000
+
+/* shutdown() (not close(): the coord task owns the descriptor and closes it
+ * itself) makes a recv() blocked on the control connection return at once.
+ * Its reads wait up to 60 s (SO_RCVTIMEO while a MapResponse comes in), so a
+ * stop then outlasted its 20 s wait and the instance was leaked. Each
+ * descriptor is shut down once. An AT modem socket isn't an lwIP one: the
+ * coord task's own timeouts apply there. */
+static void ml_unblock_coord(tailtiny_t *ml, int *done_fd) {
+    int fd = ml->coord_sock;
+    if (fd < 0 || fd == *done_fd || ml_at_socket_is_at_fd(fd)) return;
+    shutdown(fd, SHUT_RDWR);
+    *done_fd = fd;
+    ESP_LOGI(TAG, "Stop: shut down the control connection to unblock the coord task");
+}
+
+/* Free what the queues still hold. Every rx packet and DERP TX item owns a
+ * heap buffer and every peer update is a heap struct; vQueueDelete() only
+ * drops the slots, so they leaked on each destroy, and a start after a stop
+ * handed the last run's packets and peer updates to the new tasks. Only
+ * with no task running. */
+static void ml_drain_queues(tailtiny_t *ml) {
+    int freed = 0;
+    ml_rx_packet_t pkt;
+    QueueHandle_t rx_queues[] = { ml->disco_rx_queue, ml->wg_rx_queue, ml->stun_rx_queue };
+    for (size_t i = 0; i < sizeof(rx_queues) / sizeof(rx_queues[0]); i++) {
+        if (!rx_queues[i]) continue;
+        while (xQueueReceive(rx_queues[i], &pkt, 0) == pdTRUE) { free(pkt.data); freed++; }
+    }
+    if (ml->derp_tx_queue) {
+        ml_derp_tx_item_t item;
+        while (xQueueReceive(ml->derp_tx_queue, &item, 0) == pdTRUE) { free(item.data); freed++; }
+    }
+    if (ml->peer_update_queue) {
+        ml_peer_update_t *update;
+        while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) { free(update); freed++; }
+    }
+    /* Commands own nothing; the DISCONNECT stop just sent is dropped here */
+    if (ml->coord_cmd_queue) xQueueReset(ml->coord_cmd_queue);
+    if (freed) ESP_LOGI(TAG, "Stop: freed %d queued buffers", freed);
+}
+
+/* After every task has exited: what one run leaves behind. The peer table's
+ * WireGuard indexes refer to the device the WireGuard task has freed. At the
+ * next start wg_mgr overwrites the table only where the NVS peer cache has
+ * entries, so with an empty cache a peer kept its old index,
+ * peer_update_unchanged() took it as already in WireGuard, and the new
+ * device never got it: no tunnel after a restart. The VPN address and the
+ * STUN results go too, so a start after a stop begins like the first one. */
+static void ml_reset_run_state(tailtiny_t *ml) {
+    ml_drain_queues(ml);
+
+    memset(ml->peers, 0, sizeof(ml->peers));
+    for (int i = 0; i < ML_MAX_PEERS; i++) ml->peers[i].wg_peer_index = -1;
+    ml->peer_count = 0;
+    ml->vpn_ip = 0;
+
+    ml->stun_public_ip = 0;
+    ml->stun_public_port = 0;
+    memset(ml->stun_public_ip6, 0, sizeof(ml->stun_public_ip6));
+    ml->stun_public_port6 = 0;
+    ml->stun_has_ipv6 = false;
+    ml->stun_secondary_port = 0;
+    ml->stun_nat_checked = false;
+    ml->nat_mapping_varies = false;
+}
+
 esp_err_t tailtiny_stop(tailtiny_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 
+    /* From a callback on one of our tasks (the state or peer callback): the
+     * wait below would wait for the calling task itself. */
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    if (self == ml->net_io_task || self == ml->derp_tx_task ||
+        self == ml->coord_task || self == ml->wg_mgr_task) {
+        ESP_LOGE(TAG, "tailtiny_stop() called from a TailTiny task (a callback?); "
+                      "call it from an application task");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG, "Stopping...");
+
+    /* The config UI first. Its handlers read the instance, and /api/monitor
+     * calls eTaskGetState() on the task handles: stopped after the tasks, a
+     * request during the stop could reach a task that had exited and been
+     * freed. httpd_stop() waits for a request in progress. */
+    if (ml->config_httpd) {
+        ml_config_httpd_stop(ml->config_httpd);
+    }
+
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
     ml_derp_wake(ml);
     ml_coord_wake(ml);
     ml_net_io_wake(ml);
     ml_wg_notify(ml);
-    /* The coord task's reconnect backoff waits on its command queue */
-    ml_coord_cmd_t disc = ML_CMD_DISCONNECT;
-    ml_coord_queue_send(ml, ml->coord_cmd_queue, &disc, 0);
+    /* The coord task's reconnect backoff waits on its command queue. (The
+     * queue is NULL when init failed to create it and destroys.) */
+    if (ml->coord_cmd_queue) {
+        ml_coord_cmd_t disc = ML_CMD_DISCONNECT;
+        ml_coord_queue_send(ml, ml->coord_cmd_queue, &disc, 0);
+    }
 
     /* Wait until every task has exited (each clears its bit last, then calls
      * vTaskDelete(NULL), so we must not delete them). This was a fixed 3 s
      * sleep: a task still inside a reconnect backoff (up to 16 s), the wait
      * for DERP (15 s), a DERP region probe or a TLS handshake ran on into
-     * the queues and the instance tailtiny_destroy() had freed by then. */
+     * the queues and the instance tailtiny_destroy() had freed by then. A
+     * coord task still blocked in a read after a second gets its connection
+     * shut down under it. */
     uint64_t wait_start = ml_get_time_ms();
+    uint64_t next_unblock_ms = wait_start + ML_STOP_GRACE_MS;
+    int coord_fd_done = -1;
     while (ml->tasks_alive && ml_get_time_ms() - wait_start < ML_STOP_TIMEOUT_MS) {
+        uint64_t now = ml_get_time_ms();
+        if ((ml->tasks_alive & ML_TASK_BIT_COORD) && now >= next_unblock_ms) {
+            /* Again later too: a coord task that was between connections
+             * (DNS, TCP connect) can open a new one after the first pass. */
+            ml_unblock_coord(ml, &coord_fd_done);
+            next_unblock_ms = now + ML_STOP_UNBLOCK_MS;
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     uint32_t left = ml->tasks_alive;
     if (left) {
-        ESP_LOGE(TAG, "Stop: tasks still running after %d s (mask 0x%lx); the instance won't be freed",
+        /* Nothing is released: the task still running may use the sockets,
+         * the queues and the peer table. The instance stays in ERROR, start
+         * refuses it and destroy leaks it. This used to set IDLE, and a start
+         * then ran new tasks next to the old one. Another stop waits again
+         * and finishes the job once the task has gone. */
+        ESP_LOGE(TAG, "Stop: tasks still running after %d s (mask 0x%lx); "
+                      "the instance can't be started or freed until a later stop sees them gone",
                  ML_STOP_TIMEOUT_MS / 1000, (unsigned long)left);
         ml->stop_incomplete = true;
-    } else {
-        ESP_LOGI(TAG, "Stop: all tasks exited in %llu ms",
-                 (unsigned long long)(ml_get_time_ms() - wait_start));
+        ml->state = ML_STATE_ERROR;
+        return ESP_ERR_TIMEOUT;
     }
+    ESP_LOGI(TAG, "Stop: all tasks exited in %llu ms",
+             (unsigned long long)(ml_get_time_ms() - wait_start));
+    ml->stop_incomplete = false;
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;
     ml->coord_task = NULL;
     ml->wg_mgr_task = NULL;
-
-    /* Stop HTTP config server */
-    if (ml->config_httpd) {
-        ml_config_httpd_stop(ml->config_httpd);
-    }
 
     /* Clean up zero-copy PCB if active */
 #ifdef CONFIG_ML_ZERO_COPY_WG
@@ -650,6 +799,8 @@ esp_err_t tailtiny_stop(tailtiny_t *ml) {
     if (ml->stun_sock >= 0) { ml_close_sock(ml->stun_sock); ml->stun_sock = -1; }
     if (ml->stun_sock6 >= 0) { ml_close_sock(ml->stun_sock6); ml->stun_sock6 = -1; }
 
+    ml_reset_run_state(ml);
+
     ml->state = ML_STATE_IDLE;
     ESP_LOGI(TAG, "Stopped");
     return ESP_OK;
@@ -658,8 +809,13 @@ esp_err_t tailtiny_stop(tailtiny_t *ml) {
 void tailtiny_destroy(tailtiny_t *ml) {
     if (!ml) return;
 
-    tailtiny_stop(ml);
-    if (ml->stop_incomplete) {
+    esp_err_t err = tailtiny_stop(ml);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* Called on one of our own tasks: it can't wait for itself */
+        ESP_LOGE(TAG, "Destroy: called from a TailTiny task, not destroyed");
+        return;
+    }
+    if (err != ESP_OK || ml->stop_incomplete) {
         /* A task still uses the instance and its queues: leaking them beats
          * the crash freeing them would cause. */
         ESP_LOGE(TAG, "Destroy: a task is still running, leaking the instance");
@@ -679,7 +835,7 @@ void tailtiny_destroy(tailtiny_t *ml) {
     if (ml->coord_wake_fd >= 0) { close(ml->coord_wake_fd); ml->coord_wake_fd = -1; }
     if (ml->net_io_wake_fd >= 0) { close(ml->net_io_wake_fd); ml->net_io_wake_fd = -1; }
 
-    /* Delete queues */
+    /* Delete queues (tailtiny_stop() above freed the buffers they held) */
     if (ml->derp_tx_queue) vQueueDelete(ml->derp_tx_queue);
     if (ml->disco_rx_queue) vQueueDelete(ml->disco_rx_queue);
     if (ml->wg_rx_queue) vQueueDelete(ml->wg_rx_queue);
@@ -727,6 +883,9 @@ esp_err_t tailtiny_get_peer_info(const tailtiny_t *ml, int index, tailtiny_peer_
     const ml_peer_t *p = &ml->peers[index];
     info->vpn_ip = p->vpn_ip;
     strncpy(info->hostname, p->hostname, sizeof(info->hostname) - 1);
+    /* strncpy() leaves the last byte as it was, and callers pass a struct
+     * they haven't initialised */
+    info->hostname[sizeof(info->hostname) - 1] = '\0';
     memcpy(info->public_key, p->public_key, 32);
     info->online = p->online;
     info->direct_path = p->has_direct_path;
@@ -739,18 +898,20 @@ esp_err_t tailtiny_get_peer_info(const tailtiny_t *ml, int index, tailtiny_peer_
 
 esp_err_t tailtiny_send(tailtiny_t *ml, uint32_t dest_vpn_ip,
                           const uint8_t *data, size_t len) {
-    if (!ml || !data || len == 0 || len > 1400) return ESP_ERR_INVALID_ARG;
-    if (ml->state != ML_STATE_CONNECTED) return ESP_ERR_INVALID_STATE;
-
-    /* Find peer by VPN IP */
-    for (int i = 0; i < ml->peer_count; i++) {
-        if (ml->peers[i].vpn_ip == dest_vpn_ip && ml->peers[i].active) {
-            /* TODO: Route through WireGuard tunnel */
-            /* For now, queue via DERP as fallback */
-            return ml_derp_queue_send(ml, ml->peers[i].public_key, data, len);
-        }
+    /* This put the raw payload into a DERP packet, outside WireGuard: the
+     * relay could read it, and the peer dropped it because it isn't a
+     * WireGuard packet. Nothing in TailTiny used it. Refused instead of
+     * sending data in the clear; tailtiny_udp_* and tailtiny_tcp_* go
+     * through the tunnel. Logged once, in case it's called in a loop. */
+    static bool s_warned;
+    (void)dest_vpn_ip; (void)data; (void)len;
+    if (!ml) return ESP_ERR_INVALID_ARG;
+    if (!s_warned) {
+        s_warned = true;
+        ESP_LOGE(TAG, "tailtiny_send() isn't supported (it sent the data unencrypted); "
+                      "use tailtiny_udp_send() or tailtiny_tcp_send()");
     }
-    return ESP_ERR_NOT_FOUND;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 /* ============================================================================

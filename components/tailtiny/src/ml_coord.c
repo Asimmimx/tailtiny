@@ -78,15 +78,55 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *hex) {
     hex[len * 2] = '\0';
 }
 
-static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
-    size_t hex_len = strlen(hex);
-    if (hex_len % 2 != 0 || hex_len / 2 > max_len) return -1;
-    for (size_t i = 0; i < hex_len / 2; i++) {
-        unsigned int val;
-        if (sscanf(hex + i * 2, "%2x", &val) != 1) return -1;
-        bytes[i] = (uint8_t)val;
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode a 32-byte key: "<prefix>" (optional, e.g. "nodekey:") followed by
+ * exactly 64 hex digits. Anything else returns false and leaves key all
+ * zero. The old decoder took a short string as the first bytes of a key
+ * (sscanf("%2x") also took "0g" as one digit) and nobody checked its result:
+ * a malformed Key in a peer record became a zero or partial key, and
+ * add_peer() then replaced the working peer with that NodeID. */
+static bool parse_key32(const char *s, const char *prefix, uint8_t key[32]) {
+    memset(key, 0, 32);
+    if (!s) return false;
+    size_t plen = prefix ? strlen(prefix) : 0;
+    if (plen && strncmp(s, prefix, plen) == 0) s += plen;
+    if (strlen(s) != 64) return false;
+    uint8_t tmp[32];
+    for (int i = 0; i < 32; i++) {
+        int hi = hex_nibble(s[i * 2]);
+        int lo = hex_nibble(s[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        tmp[i] = (uint8_t)((hi << 4) | lo);
     }
-    return hex_len / 2;
+    memcpy(key, tmp, 32);
+    return true;
+}
+
+static bool key32_is_zero(const uint8_t key[32]) {
+    uint8_t acc = 0;
+    for (int i = 0; i < 32; i++) acc |= key[i];
+    return acc == 0;
+}
+
+/* int64 as decimal text. newlib-nano's printf (CONFIG_NEWLIB_NANO_FORMAT,
+ * the default on the ESP32-C2) has no %lld: it prints garbage and shifts
+ * every later argument. Tailscale NodeIDs don't fit in 32 bits. */
+static const char *fmt_i64(int64_t v, char buf[24]) {
+    char *p = buf + 23;
+    *p = '\0';
+    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    do {
+        *--p = (char)('0' + (u % 10));
+        u /= 10;
+    } while (u);
+    if (v < 0) *--p = '-';
+    return p;
 }
 
 /* ============================================================================
@@ -111,43 +151,95 @@ static int coord_send(tailtiny_t *ml, const uint8_t *data, size_t len) {
     return 0;
 }
 
-static int coord_recv(tailtiny_t *ml, uint8_t *buf, size_t len) {
+/* Limits for finishing a read that has started. They are wall-clock times:
+ * each recv() can block for a full SO_RCVTIMEO (2-60 s), so the old limit of
+ * 300 retries meant anything from 3 s to 5 hours (10 min in the long-poll).
+ * STALL bounds the time without progress, TOTAL the whole read (a 4 KB Noise
+ * frame over the ~450 B/s cellular AT socket bridge takes ~10 s). Both are
+ * checked when a recv() returns, so a read can overrun them by up to one
+ * SO_RCVTIMEO. */
+#define COORD_RECV_STALL_MS   30000
+#define COORD_RECV_TOTAL_MS   90000
+
+/* Read exactly len bytes from the control connection. Returns 0, or -1 with
+ * errno set.
+ *
+ * must_complete=false: if the socket times out before the first byte, this
+ * returns -1 with errno EAGAIN and nothing consumed, and the caller may try
+ * again later (the long-poll waiting for its next frame). Once a byte has
+ * been consumed the read has to finish, or the Noise frame stream is
+ * misaligned for good.
+ * must_complete=true: the caller has already consumed something this read
+ * belongs to (a Noise frame header), so even "nothing yet" must finish.
+ *
+ * A read that has to finish waits at most COORD_RECV_STALL_MS without
+ * progress and COORD_RECV_TOTAL_MS in total, and stops on shutdown. Those
+ * failures set errno ETIMEDOUT or ECANCELED, never EAGAIN: the stream can't
+ * be used after them and the caller must reconnect. */
+static int coord_recv_ex(tailtiny_t *ml, uint8_t *buf, size_t len, bool must_complete) {
     size_t recvd = 0;
-    int retries = 0;
+    uint64_t start_ms = ml_get_time_ms();
+    uint64_t progress_ms = start_ms;
     while (recvd < len) {
         int n = ml_recv(ml->coord_sock, buf + recvd, len - recvd, 0);
         if (n == 0) {
             /* Server closed the connection. errno is not set by recv() here
              * and may still hold an old EAGAIN, which callers would read as
              * "no data yet" and keep polling a dead socket. */
-            ESP_LOGW(TAG, "coord_recv: connection closed by server");
+            ESP_LOGW(TAG, "coord_recv: connection closed by server (recvd %d/%d)",
+                     (int)recvd, (int)len);
             errno = ENOTCONN;
             return -1;
         }
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (recvd == 0) {
+                if (recvd == 0 && !must_complete) {
                     /* No data consumed yet — timeout is fine, caller can retry */
                     return -1;
                 }
-                /* Partial data consumed — we MUST finish this read or the
-                 * Noise frame stream will be misaligned. Retry with backoff. */
-                if (++retries > 300) {  /* ~3 seconds */
-                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes",
+                uint64_t now = ml_get_time_ms();
+                if (xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST) {
+                    ESP_LOGW(TAG, "coord_recv: shutdown at %d/%d bytes",
                              (int)recvd, (int)len);
+                    errno = ECANCELED;
+                    return -1;
+                }
+                if (now - progress_ms >= COORD_RECV_STALL_MS ||
+                    now - start_ms >= COORD_RECV_TOTAL_MS) {
+                    ESP_LOGE(TAG, "coord_recv partial timeout: %d/%d bytes after %lu ms",
+                             (int)recvd, (int)len, (unsigned long)(now - start_ms));
+                    errno = ETIMEDOUT;
                     return -1;
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
+            int err = errno;  /* logging may clobber it; callers test it */
             ESP_LOGE(TAG, "coord_recv failed: %d (errno %d, recvd %d/%d)",
-                     n, errno, (int)recvd, (int)len);
+                     n, err, (int)recvd, (int)len);
+            errno = err;
             return -1;
         }
+        uint64_t now = ml_get_time_ms();
+        if (recvd == 0 && !must_complete) {
+            start_ms = now;  /* the clock starts with the first byte */
+        }
         recvd += n;
-        retries = 0;  /* Reset on successful read */
+        progress_ms = now;
+        /* Also bounds a peer that trickles a byte now and then, which never
+         * lets recv() time out */
+        if (recvd < len && now - start_ms >= COORD_RECV_TOTAL_MS) {
+            ESP_LOGE(TAG, "coord_recv too slow: %d/%d bytes after %lu ms",
+                     (int)recvd, (int)len, (unsigned long)(now - start_ms));
+            errno = ETIMEDOUT;
+            return -1;
+        }
     }
     return 0;
+}
+
+static int coord_recv(tailtiny_t *ml, uint8_t *buf, size_t len) {
+    return coord_recv_ex(ml, buf, len, false);
 }
 
 /* ============================================================================
@@ -195,7 +287,13 @@ static const char *const s_unused_map_keys[] = {
 /* Receive and decrypt a Noise transport frame, returns plaintext length.
  * If plaintext is NULL, a buffer of exactly the frame's plaintext size
  * (+1 spare byte for a NUL terminator) is allocated and returned via
- * *alloc_out; the caller frees it. */
+ * *alloc_out; the caller frees it.
+ * On -1, errno is EAGAIN only when nothing was consumed (no frame yet).
+ * Every other failure sets another errno (EBADMSG, EMSGSIZE, ENOMEM,
+ * ETIMEDOUT, ...): the stream can't be used after it. poll_map_update()
+ * takes EAGAIN as "no data", and these returned -1 with whatever errno was
+ * left, often an old EAGAIN, so a desynced stream kept being polled until
+ * the 120 s watchdog. */
 static int noise_recv_impl(tailtiny_t *ml, ml_noise_state_t *noise,
                             uint8_t *plaintext, size_t max_len,
                             uint8_t **alloc_out) {
@@ -205,14 +303,28 @@ static int noise_recv_impl(tailtiny_t *ml, ml_noise_state_t *noise,
 
     if (hdr[0] != 0x04) {
         ESP_LOGE(TAG, "Unexpected Noise frame type: 0x%02x", hdr[0]);
+        errno = EBADMSG;
         return -1;
     }
 
     uint16_t ct_len = (hdr[1] << 8) | hdr[2];
-    if (ct_len < 16) return -1;
+    if (ct_len < 16) {
+        ESP_LOGE(TAG, "Noise frame shorter than its MAC: %u bytes", (unsigned)ct_len);
+        errno = EBADMSG;
+        return -1;
+    }
+    /* Tailscale's control frames are at most 4 KB (controlbase maxMessageSize).
+     * The length isn't authenticated yet, and on plain TCP/80 anyone on the
+     * path can write one: refuse a big one before allocating for it. */
+    if (ct_len > 16384 + 16) {
+        ESP_LOGE(TAG, "Noise frame of %u bytes is larger than the protocol allows", (unsigned)ct_len);
+        errno = EMSGSIZE;
+        return -1;
+    }
     size_t pt_len = ct_len - 16;
     if (pt_len > max_len) {
         ESP_LOGE(TAG, "Noise frame too large: %d > %d", (int)pt_len, (int)max_len);
+        errno = EMSGSIZE;
         return -1;
     }
 
@@ -237,18 +349,16 @@ static int noise_recv_impl(tailtiny_t *ml, ml_noise_state_t *noise,
         *alloc_out = plaintext;
     }
 
-    /* Header already consumed — payload read MUST complete or stream
-     * alignment is permanently lost. Retry EAGAIN (coord_recv returns -1
-     * with errno==EAGAIN if recvd==0 on first byte). */
-    int payload_retries = 0;
-    while (coord_recv(ml, ciphertext, ct_len) < 0) {
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) && ++payload_retries <= 300) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d retries=%d errno=%d",
-                 ct_len, payload_retries, errno);
+    /* Header already consumed — the payload read must complete, in one
+     * bounded read. This used to call coord_recv() again from offset 0 after
+     * a partial read timed out, so the bytes already read were lost and the
+     * rest of the payload was later taken for frame headers: the stream was
+     * misaligned for good. Any failure here is a hard error. */
+    if (coord_recv_ex(ml, ciphertext, ct_len, true) < 0) {
+        int err = errno;
+        ESP_LOGE(TAG, "noise_recv payload failed: ct_len=%d errno=%d", ct_len, err);
         free(ciphertext);
+        errno = err;
         return -1;
     }
 
@@ -256,8 +366,9 @@ static int noise_recv_impl(tailtiny_t *ml, ml_noise_state_t *noise,
                           NULL, 0,
                           ciphertext, ct_len,
                           plaintext) != ESP_OK) {
-        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)noise->rx_nonce);
+        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%lu)", (unsigned long)noise->rx_nonce);
         free(ciphertext);
+        errno = EBADMSG;
         return -1;
     }
     noise->rx_nonce++;
@@ -277,8 +388,10 @@ static int noise_recv_alloc(tailtiny_t *ml, ml_noise_state_t *noise, uint8_t **o
     *out = NULL;
     int len = noise_recv_impl(ml, noise, NULL, 65535, out);
     if (len < 0 && *out) {
+        int err = errno;  /* the caller tells "no data" from an error by it */
         free(*out);
         *out = NULL;
+        errno = err;
     }
     return len;
 }
@@ -301,7 +414,7 @@ static int do_tcp_connect(tailtiny_t *ml) {
     }
 
     int64_t t_dns = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] DNS resolve: %lld ms", (t_dns - t_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] DNS resolve: %ld ms", (long)((t_dns - t_start) / 1000));
 
     int sock = ml_socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
@@ -336,8 +449,8 @@ static int do_tcp_connect(tailtiny_t *ml) {
     ml_freeaddrinfo(res);
 
     int64_t t_tcp = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] TCP connect: %lld ms (total: %lld ms)",
-             (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] TCP connect: %ld ms (total: %ld ms)",
+             (long)((t_tcp - t_dns) / 1000), (long)((t_tcp - t_start) / 1000));
 
     ml->coord_sock = sock;
     return 0;
@@ -350,6 +463,55 @@ static int do_tcp_connect(tailtiny_t *ml) {
 /* Server proactive data (stored between handshake and H2 preface) */
 static uint8_t *s_server_extra_data = NULL;
 static int s_server_extra_data_len = 0;
+
+/* Upper bound for the proactive frames kept from the handshake. EarlyNoise
+ * is a few small frames; Tailscale's control server never writes a frame
+ * over 4 KB. */
+#define PROACTIVE_MAX_BYTES  16384
+
+/* The read that picked up the proactive frames can end in the middle of one
+ * (on slow links HTTP 101, msg2 and part of an EarlyNoise frame arrive in one
+ * segment). The cut-off frame used to be skipped and its tail left on the
+ * socket, where the next read took it for a frame header: decryption failed
+ * and the client reconnected (intermittent, mostly on cellular). Read the
+ * missing bytes so the buffer ends on a frame boundary.
+ * *buf is replaced when it grows. Returns 0, or -1 if the rest never came. */
+static int complete_proactive_frames(tailtiny_t *ml, uint8_t **buf, int *len) {
+    int off = 0;
+    for (;;) {
+        int need = 0;
+        while (off < *len) {
+            if (off + 3 > *len) {
+                need = off + 3 - *len;          /* frame header cut off */
+                break;
+            }
+            int fl = ((*buf)[off + 1] << 8) | (*buf)[off + 2];
+            if (off + 3 + fl > *len) {
+                need = off + 3 + fl - *len;     /* frame payload cut off */
+                break;
+            }
+            off += 3 + fl;
+        }
+        if (need == 0) return 0;
+
+        if (*len + need > PROACTIVE_MAX_BYTES) {
+            ESP_LOGE(TAG, "Proactive frame at offset %d too large (%d bytes missing)", off, need);
+            return -1;
+        }
+        ESP_LOGI(TAG, "Incomplete proactive frame at offset %d, reading %d more bytes", off, need);
+        uint8_t *nb = ml_psram_malloc(*len + need);
+        if (!nb) return -1;
+        memcpy(nb, *buf, *len);
+        free(*buf);
+        *buf = nb;
+        /* Part of this frame is already consumed: the rest has to come */
+        if (coord_recv_ex(ml, nb + *len, need, true) < 0) {
+            ESP_LOGE(TAG, "Rest of proactive frame did not arrive");
+            return -1;
+        }
+        *len += need;
+    }
+}
 
 static int do_noise_handshake(tailtiny_t *ml, ml_noise_state_t *noise) {
     int64_t t_noise_start = esp_timer_get_time();
@@ -513,7 +675,7 @@ static int do_noise_handshake(tailtiny_t *ml, ml_noise_state_t *noise) {
     }
 
     int64_t t_noise_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Noise handshake: %lld ms", (t_noise_done - t_noise_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] Noise handshake: %ld ms", (long)((t_noise_done - t_noise_start) / 1000));
     ESP_LOGI(TAG, "Noise handshake complete, transport keys derived");
 
     /* Save extra data after msg2 (proactive server transport frames)
@@ -563,6 +725,16 @@ static int do_noise_handshake(tailtiny_t *ml, ml_noise_state_t *noise) {
         ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &normal_tv, sizeof(normal_tv));
     }
 
+    /* Proactive frames we couldn't keep (out of memory) or finish are lost
+     * from the stream: every later frame would fail to decrypt. Start over. */
+    if (extra_len > 0 &&
+        (!extra_data || complete_proactive_frames(ml, &extra_data, &extra_len) < 0)) {
+        ESP_LOGE(TAG, "Proactive frames lost, restarting the handshake");
+        free(extra_data);
+        free(body_buf);
+        return -1;
+    }
+
     if (extra_data && extra_len > 0) {
         /* Count proactive transport frames */
         int offset = 0;
@@ -600,12 +772,16 @@ static int do_noise_handshake(tailtiny_t *ml, ml_noise_state_t *noise) {
  * ========================================================================== */
 
 static void process_proactive_frames(tailtiny_t *ml, ml_noise_state_t *noise) {
+    /* Every connection starts without a challenge. This was cleared only
+     * after the early return below, so a connection without EarlyNoise data
+     * answered the previous connection's challenge. */
+    s_has_node_key_challenge = false;
+    memset(s_node_key_challenge, 0, sizeof(s_node_key_challenge));
     if (!s_server_extra_data || s_server_extra_data_len <= 0) {
         return;
     }
 
     ESP_LOGI(TAG, "Processing %d bytes of server proactive data", s_server_extra_data_len);
-    s_has_node_key_challenge = false;
 
     /* Decrypt ALL proactive frames and accumulate plaintext.
      * EarlyNoise content (magic + length + JSON) is split across
@@ -682,11 +858,14 @@ static void process_proactive_frames(tailtiny_t *ml, ml_noise_state_t *noise) {
 
                     /* Parse "chalpub:hex..." format (v1 lines 1402-1424) */
                     if (strncmp(chal_str, "chalpub:", 8) == 0) {
-                        const char *hex = chal_str + 8;
-                        if (strlen(hex) >= 64) {
-                            hex_to_bytes(hex, s_node_key_challenge, 32);
+                        /* Exactly 64 hex digits. ">= 64" took a longer
+                         * string, which the old decoder then refused, and
+                         * still answered the all-zero challenge it left. */
+                        if (parse_key32(chal_str, "chalpub:", s_node_key_challenge)) {
                             s_has_node_key_challenge = true;
                             ESP_LOGI(TAG, "NodeKeyChallenge decoded (32 bytes)");
+                        } else {
+                            ESP_LOGW(TAG, "NodeKeyChallenge malformed, ignored");
                         }
                     }
                 }
@@ -748,7 +927,12 @@ static int do_h2_preface(tailtiny_t *ml, ml_noise_state_t *noise) {
     /* Read and process server's response (SETTINGS, SETTINGS_ACK, WINDOW_UPDATE, etc.) */
     uint8_t recv_buf[4096];
     int recv_len = noise_recv(ml, noise, recv_buf, sizeof(recv_buf));
-    if (recv_len < 0) {
+    if (recv_len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        /* A frame was cut off, didn't decrypt, or the server closed: the
+         * stream is unusable, and register would only fail on it later */
+        ESP_LOGE(TAG, "H2 preface response failed (errno %d)", errno);
+        return -1;
+    } else if (recv_len < 0) {
         ESP_LOGW(TAG, "No immediate H2 response from server (may come later)");
         /* Not fatal - server may send its frames later */
     } else {
@@ -756,7 +940,7 @@ static int do_h2_preface(tailtiny_t *ml, ml_noise_state_t *noise) {
     }
 
     int64_t t_h2_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] H2 preface: %lld ms", (t_h2_done - t_h2_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] H2 preface: %ld ms", (long)((t_h2_done - t_h2_start) / 1000));
 
     return 0;
 }
@@ -870,8 +1054,8 @@ static int do_register(tailtiny_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     int64_t t_reg_sent = esp_timer_get_time();
-    ESP_LOGI(TAG, "RegisterRequest sent (%d H2 bytes) [TIMING] send: %lld ms",
-             h2_pos, (t_reg_sent - t_reg_start) / 1000);
+    ESP_LOGI(TAG, "RegisterRequest sent (%d H2 bytes) [TIMING] send: %ld ms",
+             h2_pos, (long)((t_reg_sent - t_reg_start) / 1000));
 
     /* Read RegisterResponse - accumulate all Noise frames into H2 buffer first,
      * then parse H2 frames (same pattern as MapResponse). The response is
@@ -1103,7 +1287,7 @@ static int do_register(tailtiny_t *ml, ml_noise_state_t *noise) {
     cJSON_Delete(resp_json);
 
     int64_t t_reg_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] Register total: %lld ms", (t_reg_done - t_reg_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] Register total: %ld ms", (long)((t_reg_done - t_reg_start) / 1000));
 
     return 0;
 }
@@ -1121,21 +1305,24 @@ static void queue_peer_patch(tailtiny_t *ml, cJSON *patch, int64_t node_id,
     update->action = ML_PEER_UPDATE_ENDPOINT;
     update->node_id = node_id;
     update->online = online;
-    if (nodekey) {
-        const char *hex = nodekey;
-        if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-        hex_to_bytes(hex, update->public_key, 32);
+    if (nodekey && !parse_key32(nodekey, "nodekey:", update->public_key)) {
+        /* The patch names its peer by this key alone: it can't be applied */
+        ESP_LOGW(TAG, "  Patch with malformed node key ignored");
+        free(update);
+        return;
     }
 
     if (patch) {
         cJSON *patch_online = cJSON_GetObjectItem(patch, "Online");
         if (cJSON_IsBool(patch_online)) update->online = cJSON_IsTrue(patch_online) ? 1 : 0;
 
+        /* A malformed DiscoKey leaves disco_key all zero, which the WireGuard
+         * task reads as "unchanged". A partial key was taken as a new one and
+         * broke DISCO with that peer. */
         cJSON *disco = cJSON_GetObjectItem(patch, "DiscoKey");
-        if (disco && disco->valuestring) {
-            const char *hex = disco->valuestring;
-            if (strncmp(hex, "discokey:", 9) == 0) hex += 9;
-            hex_to_bytes(hex, update->disco_key, 32);
+        if (disco && disco->valuestring &&
+            !parse_key32(disco->valuestring, "discokey:", update->disco_key)) {
+            ESP_LOGW(TAG, "  Patch with malformed DiscoKey: DISCO key left unchanged");
         }
 
         /* DERP region: DERPRegion (int) first, then the legacy DERP string */
@@ -1174,8 +1361,9 @@ static void queue_peer_patch(tailtiny_t *ml, cJSON *patch, int64_t node_id,
         }
     }
 
-    ESP_LOGD(TAG, "  Patch peer: node %lld eps=%d derp=%d online=%d",
-             (long long)node_id, update->endpoint_count, update->derp_region, update->online);
+    char id_str[24];
+    ESP_LOGD(TAG, "  Patch peer: node %s eps=%d derp=%d online=%d",
+             fmt_i64(node_id, id_str), update->endpoint_count, update->derp_region, update->online);
 
     if (ml_wg_queue_send(ml, ml->peer_update_queue, &update, pdMS_TO_TICKS(100)) != pdTRUE) {
         free(update);
@@ -1278,20 +1466,33 @@ static void parse_peers_from_map_response(tailtiny_t *ml, cJSON *root) {
             }
         }
 
-        /* NodeKey: "nodekey:HEX..." */
+        /* NodeKey: "nodekey:HEX...". A record without a usable key (missing,
+         * malformed or all zero) is skipped: as a zero or partial key,
+         * add_peer() took it for this node's new key and removed the working
+         * peer with the same NodeID. It also leaves the list incomplete, so
+         * the sweep below doesn't remove that peer either. */
         cJSON *key = cJSON_GetObjectItem(peer, "Key");
-        if (key && key->valuestring) {
-            const char *hex = key->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
+        if (!cJSON_IsString(key) ||
+            !parse_key32(key->valuestring, "nodekey:", update->public_key) ||
+            key32_is_zero(update->public_key)) {
+            ESP_LOGW(TAG, "  Peer %s: malformed Key, ignored",
+                     update->hostname[0] ? update->hostname : "(unnamed)");
+            free(update);
+            list_complete = false;
+            continue;
         }
 
-        /* DiscoKey: "discokey:HEX..." */
+        /* DiscoKey: "discokey:HEX...". Missing leaves it zero, as before; a
+         * malformed one skips the record like a malformed Key (a partial
+         * DISCO key breaks DISCO with that peer). */
         cJSON *disco = cJSON_GetObjectItem(peer, "DiscoKey");
-        if (disco && disco->valuestring) {
-            const char *hex = disco->valuestring;
-            if (strncmp(hex, "discokey:", 9) == 0) hex += 9;
-            hex_to_bytes(hex, update->disco_key, 32);
+        if (disco && disco->valuestring &&
+            !parse_key32(disco->valuestring, "discokey:", update->disco_key)) {
+            ESP_LOGW(TAG, "  Peer %s: malformed DiscoKey, ignored",
+                     update->hostname[0] ? update->hostname : "(unnamed)");
+            free(update);
+            list_complete = false;
+            continue;
         }
 
         /* VPN IP from Addresses */
@@ -1390,11 +1591,14 @@ check_removed:
 
             if (cJSON_IsNumber(key_item)) {
                 update->node_id = (int64_t)key_item->valuedouble;
-                ESP_LOGI(TAG, "  Remove peer: node %lld", (long long)update->node_id);
+                char id_str[24];
+                ESP_LOGI(TAG, "  Remove peer: node %s", fmt_i64(update->node_id, id_str));
             } else {
-                const char *hex = key_item->valuestring;
-                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                hex_to_bytes(hex, update->public_key, 32);
+                if (!parse_key32(key_item->valuestring, "nodekey:", update->public_key)) {
+                    ESP_LOGW(TAG, "  PeersRemoved entry with malformed key ignored");
+                    free(update);
+                    continue;
+                }
                 ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
                          update->public_key[0], update->public_key[1],
                          update->public_key[2], update->public_key[3]);
@@ -1690,7 +1894,7 @@ static int do_fetch_peers(tailtiny_t *ml, ml_noise_state_t *noise) {
     free(h2_buf);
 
     int64_t t_map_sent = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] MapRequest send: %lld ms", (t_map_sent - t_map_start) / 1000);
+    ESP_LOGI(TAG, "[TIMING] MapRequest send: %ld ms", (long)((t_map_sent - t_map_start) / 1000));
 
     /* Read MapResponse - accumulate ALL decrypted Noise frames first, then parse H2.
      * This is critical because a single H2 frame can span multiple Noise frames
@@ -1955,8 +2159,14 @@ static int do_fetch_peers(tailtiny_t *ml, ml_noise_state_t *noise) {
                     ESP_LOGI(TAG, "  - %s (object)", field->string);
                 else if (cJSON_IsString(field))
                     ESP_LOGI(TAG, "  - %s (string): %.40s", field->string, field->valuestring);
-                else if (cJSON_IsNumber(field))
-                    ESP_LOGI(TAG, "  - %s (number): %g", field->string, field->valuedouble);
+                else if (cJSON_IsNumber(field)) {
+                    /* No %g: newlib-nano's printf has no floats (see fmt_i64).
+                     * The MapResponse's numbers are integers (Seq, durations). */
+                    char num_str[24];
+                    double v = field->valuedouble;
+                    ESP_LOGI(TAG, "  - %s (number): %s", field->string,
+                             (v > -9.2e18 && v < 9.2e18) ? fmt_i64((int64_t)v, num_str) : "(out of range)");
+                }
                 else if (cJSON_IsBool(field))
                     ESP_LOGI(TAG, "  - %s (bool): %s", field->string, cJSON_IsTrue(field) ? "true" : "false");
                 else
@@ -2023,25 +2233,14 @@ static int do_fetch_peers(tailtiny_t *ml, ml_noise_state_t *noise) {
             /* Parse KeyExpiry (ISO 8601: "YYYY-MM-DDTHH:MM:SSZ") */
             cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
             if (key_expiry && key_expiry->valuestring) {
-                int yr, mo, dy, hr, mn, sc;
-                if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
-                           &yr, &mo, &dy, &hr, &mn, &sc) >= 6) {
-                    /* Simple epoch calculation (approximate, no leap second) */
-                    /* Days from year 1970 */
-                    int64_t days = 0;
-                    for (int y = 1970; y < yr; y++) {
-                        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
-                    }
-                    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-                    for (int m = 1; m < mo; m++) {
-                        days += mdays[m];
-                        if (m == 2 && (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0))) days++;
-                    }
-                    days += dy - 1;
-                    ml->key_expiry_epoch = days * 86400 + hr * 3600 + mn * 60 + sc;
-                    ESP_LOGI(TAG, "Key expiry: %s (epoch: %lld)", key_expiry->valuestring,
-                             (long long)ml->key_expiry_epoch);
-                }
+                /* The range-checked parser: the old one looped once per year
+                 * up to whatever year it was sent and indexed a 13-entry month
+                 * table with the month as sent. Key expiry off is
+                 * "0001-01-01T00:00:00Z", before 1970: 0 (no expiry), as before. */
+                int64_t t = parse_rfc3339_utc(key_expiry->valuestring);
+                ml->key_expiry_epoch = t > 0 ? t : 0;
+                ESP_LOGI(TAG, "Key expiry: %s (epoch: %lu)", key_expiry->valuestring,
+                         (unsigned long)ml->key_expiry_epoch);
             }
 
             /* Check Expired flag */
@@ -2077,9 +2276,9 @@ static int do_fetch_peers(tailtiny_t *ml, ml_noise_state_t *noise) {
     free(resp_buf);
 
     int64_t t_map_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[TIMING] MapResponse recv+parse: %lld ms (total map: %lld ms, %dKB)",
-             (t_map_done - t_map_sent) / 1000,
-             (t_map_done - t_map_start) / 1000,
+    ESP_LOGI(TAG, "[TIMING] MapResponse recv+parse: %ld ms (total map: %ld ms, %dKB)",
+             (long)((t_map_done - t_map_sent) / 1000),
+             (long)((t_map_done - t_map_start) / 1000),
              (int)(h2_total / 1024));
 
     return 0;
@@ -2430,7 +2629,9 @@ static void lp_feed_body(tailtiny_t *ml, const uint8_t *data, size_t len) {
             want = 4 - s_lp.msg_len;
         } else {
             uint32_t body = lp_msg_announced();
-            if (body + 4 > ML_H2_BUFFER_SIZE) {
+            /* Not body + 4: a prefix of 0xFFFFFFFC or more wrapped past it,
+             * and the message buffer was sized from the wrapped value */
+            if (body > ML_H2_BUFFER_SIZE - 4) {
                 ESP_LOGW(TAG, "Long-poll MapResponse of %lu bytes is too large, skipping",
                          (unsigned long)body);
                 s_lp.msg_skip = body;

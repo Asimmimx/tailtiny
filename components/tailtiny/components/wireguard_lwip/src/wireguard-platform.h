@@ -37,9 +37,20 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
-// Peers are allocated statically inside the device structure to avoid malloc
-// Increased from 1 to support multiple Tailscale peers (10 peers for larger networks)
+// Peers are allocated statically inside the device structure to avoid malloc.
+// At least 16, and as many as TailTiny's CONFIG_ML_MAX_PEERS (range 1-64):
+// a fixed 16 left peers 17 and up of a larger setting without a tunnel
+// (wireguardif_add_peer() had no slot for them).
+#if defined(__has_include)
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#endif
+#if defined(CONFIG_ML_MAX_PEERS) && (CONFIG_ML_MAX_PEERS > 16)
+#define WIREGUARD_MAX_PEERS CONFIG_ML_MAX_PEERS
+#else
 #define WIREGUARD_MAX_PEERS 16
+#endif
 #define WIREGUARD_MAX_SRC_IPS 2
 
 // Per device limit on accepting (valid) initiation requests - per peer

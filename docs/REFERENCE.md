@@ -46,7 +46,7 @@ Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G ce
   - Zero-copy WireGuard receive (raw lwIP PCB, for 30fps+ video streaming)
   - DISCO peer filtering / allowlist (reduces jitter on large tailnets)
   - Priority peer (guaranteed WG slot even when peer table is full)
-  - Headscale / Ionscale compatible (configurable control plane host)
+  - Tailscale's hosted control server only (Headscale / Ionscale are not supported yet, see below)
   - Credential security: all secrets in git-ignored sdkconfig
 
 ## Requirements
@@ -288,10 +288,12 @@ tailtiny_set_data_callback(ml, on_data, user_data);
 // Instead of tailtiny_init() directly, use the net_switch module:
 ml_net_switch_config_t ns_config = {
     .wifi_ssid = "MyWiFi",
-    .wifi_pass = "MyPassword",
-    .cell_tx_pin = 43,
-    .cell_rx_pin = 44,
+    .wifi_password = "MyPassword",
+    .apn = "",                     // or your carrier's APN
+    .tailscale_auth_key = "tskey-auth-...",
+    .device_name = "my-esp32",
 };
+// The modem's UART pins come from Kconfig (CONFIG_ML_CELLULAR_TX_PIN / RX_PIN)
 ml_net_switch_init(&ns_config);
 ml_net_switch_start();
 
@@ -318,7 +320,7 @@ tailtiny_stop(ml);
 tailtiny_destroy(ml);
 ```
 
-`tailtiny_stop()` returns once all four tasks have exited (usually about 100 ms) and waits at most 20 s. If one is still running then, it logs `Stop: tasks still running after 20 s` and `tailtiny_destroy()` leaks the instance rather than free memory that task still uses. `tailtiny_start()` can be called again on a stopped instance.
+`tailtiny_stop()` returns `ESP_OK` once all four tasks have exited (usually about 100 ms; a control-plane read that's blocked is cut short after 1 s). It waits at most 20 s. If a task is still running then, it returns `ESP_ERR_TIMEOUT` and leaves the instance in `ML_STATE_ERROR`: `tailtiny_start()` refuses it and `tailtiny_destroy()` leaks it rather than free memory that task still uses; calling `tailtiny_stop()` again waits again. Called from a TailTiny callback (the state or peer callback), it returns `ESP_ERR_INVALID_STATE` at once, since it would wait for its own task. After `ESP_OK`, `tailtiny_start()` starts afresh: the peer table, VPN IP and STUN results are cleared, and the peers come back from the NVS cache and the control server.
 
 ### Factory Reset
 
@@ -401,13 +403,29 @@ During large downloads (MapResponse parsing, delta updates), DISCO/STUN/WG probe
 
 Enable `CONFIG_ML_ENABLE_CONFIG_HTTPD=y` in sdkconfig.defaults to get a web UI accessible at `http://<vpn-ip>/` from any device on your tailnet.
 
+**Logging in (since v3.3.0).** Every page and API call needs HTTP Basic auth: user `admin`, and the password from `CONFIG_ML_CONFIG_HTTPD_PASSWORD`. If you leave that empty (the default), a random 16-character password is made on first boot, kept in NVS, and printed once per boot when the server starts:
+
+```
+W (...) ml_config: Config UI login: user "admin", password "..." (kept in NVS since first boot; ...)
+```
+
+`tailtiny_factory_reset()` erases it with the other web UI settings. Anyone with the password can change the auth key and network settings, so treat it like one.
+
+**Where it answers.** Only on the device's own tailnet address: open `http://100.x.y.z/` from a tailnet device. Use the IP address, not a MagicDNS name: the `Host` header must be the address the request came in on (this stops DNS-rebinding pages in a browser from driving it). `CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN=y` also serves it on the WiFi station or Ethernet address; the password then crosses that LAN unencrypted. It never answers on a cellular (PPP) address. POST and DELETE requests need `Content-Type: application/json`, for example:
+
+```bash
+curl -u admin:PASSWORD -X POST -H 'Content-Type: application/json' -d '{}' http://100.x.y.z/api/restart
+```
+
+Values that would reach the modem are checked: the APN must be letters, digits, `-` and `.`; PPP user and password printable ASCII without `"` or `\`; the control host a host name. A request with a bad value changes nothing and gets `400` with the reason.
+
 **System Monitor** — Real-time ESP32 temperature, WiFi RSSI (or cellular indicator), uptime, heap/PSRAM usage, DERP region, peer count, per-task stack watermarks. Auto-refreshes every 3 seconds.
 
 **Peer Allowlist** — Manage which peers receive DISCO probes. Changes take effect immediately (no restart). On large tailnets (200+ devices), this limits DISCO probing to only the peers that matter.
 
 **All Tailnet Peers** — Paginated peer list (25 per page) with search/filter, direct/DERP path status, and one-click "Allow" buttons. Peers not in the allowlist show a "Not Allowed" badge when filtering is active.
 
-**Device Settings** — WiFi, Tailscale auth key, device name, cellular APN, plus advanced settings (max peers, DISCO heartbeat, priority peer, control plane host for Headscale/Ionscale, debug flags). All persist in NVS and take effect on restart.
+**Device Settings** — WiFi, Tailscale auth key, device name, cellular APN, plus advanced settings (max peers, DISCO heartbeat, priority peer, control plane host (Tailscale only for now), debug flags). All persist in NVS and take effect on restart.
 
 **Resource usage** — ~28KB flash, ~7KB RAM (6KB HTTP task stack + 1KB NVS config). Ifdef-gated: zero cost when disabled (`CONFIG_ML_ENABLE_CONFIG_HTTPD=n`).
 
@@ -533,6 +551,8 @@ TailTiny Configuration
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ML_ENABLE_CONFIG_HTTPD` | `n` | Enable web UI at `http://<vpn-ip>/` accessible from any tailnet device |
+| `ML_CONFIG_HTTPD_PASSWORD` | `""` | Login password (user `admin`). Empty: a random one is made on first boot, kept in NVS and printed in the boot log. At most 64 characters. |
+| `ML_CONFIG_HTTPD_ALLOW_LAN` | `n` | Also serve the UI on the WiFi station / Ethernet address, not only the tailnet address. |
 | `ML_CONFIG_MAX_ALLOWED_PEERS` | `16` | Max peers in DISCO probe allowlist (1-1024). Each entry: 28 bytes in NVS. Empty allowlist = probe all peers. |
 
 ### DERP Relay
@@ -546,20 +566,13 @@ V2 uses fully dynamic DERP discovery — no manual region configuration needed. 
 
 **Important:** The ESP32 must connect to the same DERP region it advertises. Tailscale peers send packets to whichever DERP region you advertise as your `PreferredDERP`. If there's a mismatch, DISCO PING/PONG packets won't reach your device.
 
-### Custom Coordination Server (Headscale / Ionscale)
+### Custom Coordination Server (Headscale / Ionscale): not supported yet
 
-TailTiny supports custom coordination servers like [Headscale](https://github.com/juanfont/headscale) and [Ionscale](https://github.com/jsiebens/ionscale). This allows you to run your own private Tailscale-compatible control plane.
+TailTiny only works with Tailscale's own control server. Earlier versions of this page said Headscale and Ionscale work and that the server's key is fetched from `/key`; that was wrong. The Noise handshake always uses Tailscale's server key (`ml_noise.c`), nothing fetches `/key`, and the control connection is plain HTTP on port 80, so a Headscale or Ionscale server can't complete the handshake. The config web UI's "Control Plane Host" field only changes which host it connects to.
 
-**Configuration:** Set the control plane host via the HTTP config server web UI (Device Settings → Control Plane Host) or programmatically via `ctrl_host` in the config struct.
+If you need Headscale or Ionscale today, use [MicroLink](https://github.com/CamM2325/microlink) v2.3.0 or later, which supports them. Support in TailTiny needs the server key to be fetched and pinned safely; contributions are welcome.
 
-**Server key:** TailTiny automatically fetches the server's Noise public key from the `/key` endpoint via HTTPS. No manual key configuration required.
-
-**Notes:**
-- Generate auth keys from your Headscale/Ionscale admin interface, not from Tailscale
-- If your custom server uses self-signed certificates, add them to the ESP32's certificate bundle
-- TailTiny implements ts2021 — ensure your coordination server supports this version
-- DERP discovery is automatic from the server's `DERPMap`
-- If you run your own DERP server with a private certificate, add its CA to the certificate bundle or turn off `CONFIG_ML_DERP_VERIFY_CERT`
+What does work with your own infrastructure: a self-run DERP relay listed in the control server's `DERPMap`. If it uses a private certificate, add its CA to the certificate bundle or turn off `CONFIG_ML_DERP_VERIFY_CERT`.
 
 ## Power Saving (Automatic Light Sleep)
 

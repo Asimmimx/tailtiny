@@ -57,11 +57,13 @@ typedef struct {
     const char *tailscale_auth_key;
     const char *device_name;
 
-    /* Timing (0 = use defaults) */
+    /* Timing (0 = use the default; the _ms defaults come from Kconfig
+     * "Network Switching", CONFIG_ML_NET_SWITCH_*_MS) */
     uint32_t wifi_timeout_ms;           /* WiFi connect timeout (default: 30000) */
     uint32_t health_check_interval_ms;  /* Health check period (default: 30000) */
     uint32_t health_fail_count;         /* Failures before switch (default: 3) */
-    uint32_t failback_check_ms;         /* WiFi recovery check (default: 120000, 0=disable) */
+    uint32_t failback_check_ms;         /* WiFi recovery check (default: 120000; set
+                                           CONFIG_ML_NET_SWITCH_FAILBACK_MS=0 to disable) */
 
     /* Callbacks (all optional) */
     void (*on_connected)(ml_net_type_t type, void *user_data);
@@ -85,6 +87,8 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config);
 
 /**
  * Deinitialize and free resources.
+ * Calls ml_net_switch_stop(); if the switch task hasn't exited, nothing is
+ * freed (an error is logged) and deinit can be called again later.
  */
 void ml_net_switch_deinit(void);
 
@@ -99,7 +103,15 @@ esp_err_t ml_net_switch_start(void);
 /**
  * Stop all connections and halt the state machine.
  *
- * @return ESP_OK on success
+ * Tells the switch task to stop and waits for it to stop and destroy
+ * TailTiny, stop the active transport and exit. No on_* callback is called
+ * for this: close sockets made on the handle before calling it.
+ * Must not be called from an on_* callback.
+ *
+ * @return ESP_OK once the task has exited,
+ *         ESP_ERR_TIMEOUT if it was still busy after 5 minutes (powering up
+ *         the modem, say); call again to keep waiting,
+ *         ESP_ERR_INVALID_STATE if called from the switch task (a callback)
  */
 esp_err_t ml_net_switch_stop(void);
 
@@ -118,14 +130,19 @@ ml_net_switch_state_t ml_net_switch_get_state(void);
 /**
  * Get the current tailtiny_t handle.
  * Returns NULL if not connected.
+ *
+ * The switch destroys the handle and creates a new one when it restarts the
+ * VPN (connect timeout, failed rebind, retry after both transports failed),
+ * so don't keep it, or sockets made on it, across a switch. Before it
+ * destroys a handle that on_connected announced, it calls on_switching or
+ * on_disconnected (ml_net_switch_stop() excepted): close the sockets there
+ * (tailtiny_udp_close()) and make them again once connected.
+ * examples/failover_connect shows the pattern.
  */
 tailtiny_t *ml_net_switch_get_handle(void);
 
-/**
- * Get the current UDP socket handle (if one was created).
- * Returns NULL if not available.
- */
-tailtiny_udp_socket_t *ml_net_switch_get_udp_socket(void);
+/* ml_net_switch_get_udp_socket() was declared here but never implemented
+ * (calling it failed to link); it's gone. */
 
 /**
  * Convert state to string for logging.

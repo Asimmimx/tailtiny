@@ -223,7 +223,8 @@ menu "TailTiny Configuration"
             default ""
             help
                 Access Point Name for cellular data connection.
-                Leave empty for auto-detection.
+                Leave empty for auto-detection. Letters, digits, '-' and '.'
+                only (3GPP TS 23.003); other values are refused at startup.
 
         config ML_CELLULAR_SIM_PIN
             string "SIM Card PIN"
@@ -231,6 +232,7 @@ menu "TailTiny Configuration"
             default ""
             help
                 PIN code for the SIM card. Leave empty if no PIN required.
+                Must be 4-8 digits; other values are refused at startup.
 
         config ML_CELLULAR_PPP_USER
             string "PPP CHAP username"
@@ -239,7 +241,8 @@ menu "TailTiny Configuration"
             help
                 Username for PPP CHAP authentication.
                 Leave empty for SIMs that use IMSI-based auth (no credentials).
-                Soracom SIMs use "sora".
+                Soracom SIMs use "sora". Printable ASCII without '"' or '\',
+                at most 64 characters.
 
         config ML_CELLULAR_PPP_PASS
             string "PPP CHAP password"
@@ -248,7 +251,8 @@ menu "TailTiny Configuration"
             help
                 Password for PPP CHAP authentication.
                 Leave empty for SIMs that use IMSI-based auth (no credentials).
-                Soracom SIMs use "sora".
+                Soracom SIMs use "sora". Printable ASCII without '"' or '\',
+                at most 64 characters.
 
     endmenu
 
@@ -336,9 +340,51 @@ menu "TailTiny Configuration"
                 (e.g., http://100.x.x.x/) for runtime configuration of
                 WiFi credentials, Tailscale auth key, peer allowlist, etc.
 
+                Every request needs HTTP Basic auth (user "admin", password
+                from ML_CONFIG_HTTPD_PASSWORD or generated on first boot).
+                It is only answered on the device's own tailnet (VPN)
+                address, plus the WiFi station / Ethernet address with
+                ML_CONFIG_HTTPD_ALLOW_LAN. Browse to the IP address itself
+                (http://100.x.y.z/): a host name in the Host header is
+                refused. Anyone with the password can change the auth key
+                and network settings.
+
                 Settings persist in NVS across reboots. The peer allowlist
                 controls which peers receive outbound DISCO probes — on large
                 tailnets this prevents wg_mgr flooding and reduces latency.
+
+        config ML_CONFIG_HTTPD_PASSWORD
+            string "Config UI password (empty = generate one on first boot)"
+            depends on ML_ENABLE_CONFIG_HTTPD
+            default ""
+            help
+                Password for the config UI (HTTP Basic auth, user "admin"),
+                at most 64 characters.
+
+                Leave empty to have a random 16-character password generated
+                on first boot and kept in NVS (namespace "ml_config", key
+                "http_pw"). It is printed on the serial console once per
+                boot, when the server starts:
+                    Config UI login: user "admin", password "..."
+                tailtiny_factory_reset() erases it; a new one is generated on
+                the next boot.
+
+                A password set here is compiled into the firmware and wins
+                over the one in NVS; it is not printed.
+
+        config ML_CONFIG_HTTPD_ALLOW_LAN
+            bool "Also serve the config UI on the WiFi / Ethernet address"
+            depends on ML_ENABLE_CONFIG_HTTPD
+            default n
+            help
+                By default the config UI only answers on the device's own
+                tailnet (VPN) address, where traffic is WireGuard-encrypted.
+                Every other address gets 403 Forbidden.
+
+                Enable to also answer on the WiFi station or Ethernet
+                interface's own address. The password then crosses that LAN
+                unencrypted (HTTP Basic auth). Never served on the cellular
+                (PPP) carrier address or the WiFi soft-AP.
 
         config ML_CONFIG_MAX_ALLOWED_PEERS
             int "Maximum peers in allowlist"

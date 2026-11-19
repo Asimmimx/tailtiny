@@ -5,6 +5,7 @@
  * Runtime configuration via web UI served on the Tailscale VPN IP.
  * Settings persist in NVS namespace "ml_config".
  * Peer allowlist controls DISCO probe filtering in wg_mgr.
+ * Every request is checked first, see "Access control" below.
  *
  * Gated by CONFIG_ML_ENABLE_CONFIG_HTTPD.
  */
@@ -14,6 +15,8 @@
 #ifdef CONFIG_ML_ENABLE_CONFIG_HTTPD
 
 #include "ml_config_httpd.h"
+#include "ml_config_guard.h"
+#include "ml_at_validate.h"
 #include "tailtiny.h"
 #include "tailtiny_internal.h"
 #include "esp_log.h"
@@ -22,6 +25,9 @@
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
+#include "esp_netif.h"
+#include "esp_random.h"
+#include "lwip/sockets.h"
 #include "soc/soc_caps.h"
 #if SOC_TEMP_SENSOR_SUPPORTED   /* not on the original ESP32 */
 #include "driver/temperature_sensor.h"
@@ -46,6 +52,10 @@ static const char *TAG = "ml_config";
 #define NVS_KEY_SETTINGS "settings"
 #define NVS_KEY_PEERS    "peers"
 #define NVS_KEY_WIFI     "wifi_list"
+#define NVS_KEY_HTTP_PW  "http_pw"   /* generated UI password (string) */
+
+/* Longest UI password (CONFIG_ML_CONFIG_HTTPD_PASSWORD or generated) */
+#define HTTP_PW_MAXLEN   64
 
 /* ============================================================================
  * Context Structure
@@ -74,21 +84,112 @@ struct ml_config_ctx {
     /* HTTP server */
     httpd_handle_t httpd;
 
+    /* UI password (HTTP Basic auth), set by http_pw_init() */
+    char http_pw[HTTP_PW_MAXLEN + 1];
+
     /* Backpointer */
     tailtiny_t *ml;
 };
 
 /* ============================================================================
- * NVS Load/Save
+ * Value checks
  * ========================================================================== */
 
 static void config_save_peers(ml_config_ctx_t *ctx);  /* forward decl for migration */
+
+/* Fields that end up in modem AT commands (APN, PPP credentials) or in the
+ * control-plane connection and the AT DNS lookup (ctrl_host) must never
+ * hold '"', CR/LF or anything else outside their grammar. The web API
+ * refuses such a value with 400, the NVS loaders drop it (and fall back to
+ * Kconfig). Each check returns NULL if the value is fine, else the reason. */
+#define FIELD_MAX(f) (sizeof(((ml_config_settings_t *)0)->f) - 1)
+
+static const char *check_cellular_apn(const char *v) {
+    return ml_at_param_valid(ML_AT_PARAM_APN, v, FIELD_MAX(cellular_apn)) ? NULL :
+        "cellular_apn: letters, digits, '-' and '.' only (max 31)";
+}
+static const char *check_ppp_user(const char *v) {
+    return ml_at_param_valid(ML_AT_PARAM_CREDENTIAL, v, FIELD_MAX(ppp_user)) ? NULL :
+        "ppp_user: printable ASCII without '\"' or '\\' (max 31)";
+}
+static const char *check_ppp_pass(const char *v) {
+    return ml_at_param_valid(ML_AT_PARAM_CREDENTIAL, v, FIELD_MAX(ppp_pass)) ? NULL :
+        "ppp_pass: printable ASCII without '\"' or '\\' (max 31)";
+}
+static const char *check_ctrl_host(const char *v) {
+    return (v[0] == '\0' || ml_at_param_valid(ML_AT_PARAM_HOSTNAME, v, FIELD_MAX(ctrl_host))) ? NULL :
+        "ctrl_host: host name of letters, digits, '-' and '.' (max 63)";
+}
+
+/* An NVS blob from older firmware, or a damaged one, need not hold
+ * NUL-terminated strings: put a terminator at the end of every string
+ * field right after loading, before anything prints or copies it. */
+#define TERMINATE(field) ((field)[sizeof(field) - 1] = '\0')
+
+static void terminate_settings_strings(ml_config_settings_t *st) {
+    TERMINATE(st->wifi_ssid);
+    TERMINATE(st->wifi_pass);
+    TERMINATE(st->auth_key);
+    TERMINATE(st->device_prefix);
+    TERMINATE(st->cellular_apn);
+    TERMINATE(st->cellular_sim_pin);
+    TERMINATE(st->ctrl_host);
+    TERMINATE(st->device_name_full);
+    TERMINATE(st->ppp_user);
+    TERMINATE(st->ppp_pass);
+}
+
+static void terminate_wifi_list_strings(ml_config_wifi_list_t *list) {
+    for (int i = 0; i < ML_CONFIG_MAX_WIFI_ENTRIES; i++) {
+        TERMINATE(list->entries[i].ssid);
+        TERMINATE(list->entries[i].pass);
+    }
+}
+
+static void terminate_peer_labels(ml_config_peer_list_t *list) {
+    for (int i = 0; i < ML_CONFIG_MAX_ALLOWED_PEERS; i++) {
+        TERMINATE(list->entries[i].label);
+    }
+}
+
+/* Older firmware saved settings without checking them: clear any field
+ * that would fail the checks above, so it can't reach the modem. */
+static void config_sanitize_settings(ml_config_settings_t *st) {
+    #define SANITIZE(field, check) do { \
+        if ((check)(st->field) != NULL) { \
+            ESP_LOGW(TAG, "Ignoring invalid saved %s (enter it again in the web UI)", #field); \
+            memset(st->field, 0, sizeof(st->field)); \
+        } \
+    } while (0)
+    SANITIZE(cellular_apn, check_cellular_apn);
+    SANITIZE(ppp_user, check_ppp_user);
+    SANITIZE(ppp_pass, check_ppp_pass);
+    SANITIZE(ctrl_host, check_ctrl_host);
+    #undef SANITIZE
+    /* Nothing ever read cellular_sim_pin (the SIM PIN comes from Kconfig
+     * or the application), and the UI no longer offers it: drop a PIN that
+     * older firmware stored, so the next save wipes it from NVS. */
+    memset(st->cellular_sim_pin, 0, sizeof(st->cellular_sim_pin));
+}
+
+/* Free a settings blob that the early-boot getters read (it holds the
+ * auth key and WiFi password) without leaving it in the heap. */
+static void free_settings(ml_config_settings_t *st) {
+    if (!st) return;
+    ml_at_secure_zero(st, sizeof(*st));
+    free(st);
+}
+
+/* ============================================================================
+ * NVS Load/Save
+ * ========================================================================== */
 
 static void config_load_settings(ml_config_ctx_t *ctx) {
     /* Read whatever size blob exists — v1 blobs are smaller than v2 struct */
     memset(&ctx->settings, 0, sizeof(ml_config_settings_t));
     size_t len = sizeof(ml_config_settings_t);
     esp_err_t err = nvs_get_blob(ctx->nvs, NVS_KEY_SETTINGS, &ctx->settings, &len);
+    terminate_settings_strings(&ctx->settings);
 
     if (err == ESP_OK && ctx->settings.version >= 1) {
         /* v1 blob is smaller — v2 fields will be zero (defaults) */
@@ -125,6 +226,8 @@ static void config_load_settings(ml_config_ctx_t *ctx) {
     }
 
     #undef SEED_STR
+
+    config_sanitize_settings(&ctx->settings);
 
     ESP_LOGI(TAG, "Settings v%d (wifi=%s, prefix=%s, name=%s, max_peers=%d, ctrl=%s, pip=%s)",
              ctx->settings.version,
@@ -198,6 +301,7 @@ static void config_load_peers(ml_config_ctx_t *ctx) {
             }
         }
 
+        terminate_peer_labels(&ctx->peer_list);
         ctx->filter_enabled = (ctx->peer_list.count > 0);
         ESP_LOGI(TAG, "Peer allowlist loaded: %d peers (filter %s)",
                  ctx->peer_list.count, ctx->filter_enabled ? "ON" : "OFF");
@@ -240,6 +344,7 @@ static void config_load_wifi_list(ml_config_ctx_t *ctx) {
             memset(&ctx->wifi_list, 0, sizeof(ctx->wifi_list));
             ctx->wifi_list.active_idx = 0xFF;
         }
+        terminate_wifi_list_strings(&ctx->wifi_list);
         ESP_LOGI(TAG, "WiFi list loaded: %d entries", ctx->wifi_list.count);
     } else {
         /* No wifi_list key — migrate from settings blob if it has WiFi creds */
@@ -335,6 +440,9 @@ uint32_t ml_config_get_priority_peer_ip(const ml_config_ctx_t *ctx) {
 
 const char *ml_config_get_ctrl_host(const ml_config_ctx_t *ctx) {
     if (!ctx || ctx->settings.ctrl_host[0] == '\0') return NULL;
+    /* Goes into the AT DNS lookup on cellular and the control connection's
+     * Host header: only a valid host name (checked on load too). */
+    if (check_ctrl_host(ctx->settings.ctrl_host) != NULL) return NULL;
     return ctx->settings.ctrl_host;
 }
 
@@ -345,6 +453,196 @@ uint8_t ml_config_get_debug_flags(const ml_config_ctx_t *ctx) {
 const char *ml_config_get_device_name_full(const ml_config_ctx_t *ctx) {
     if (!ctx || ctx->settings.device_name_full[0] == '\0') return NULL;
     return ctx->settings.device_name_full;
+}
+
+/* ============================================================================
+ * Access control
+ *
+ * The config server can change the auth key, the WiFi list, the cellular
+ * APN and PPP login and the control host, and TailTiny enforces no tailnet
+ * ACLs, so any node on the tailnet can open port 80. Every request must
+ * pass these checks, in this order:
+ *   1. It arrived on the device's own tailnet (VPN) address, or, with
+ *      CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN, on the WiFi station or Ethernet
+ *      interface's own address. Never on the cellular (PPP) address. The
+ *      address is compared with the interface's own, not with a range:
+ *      carriers hand out 100.64.0.0/10 (CGNAT) and 10/8 addresses too.
+ *      Else 403.
+ *   2. Its Host header is that same address as an IP literal, so a web
+ *      page can't reach the server through a DNS name that it points at
+ *      the device (DNS rebinding). Else 400.
+ *   3. HTTP Basic auth with the UI password. Else 401.
+ *   4. A request that changes something (POST, DELETE) has Content-Type
+ *      application/json. A page on another site can't send that without a
+ *      CORS preflight, which this server never answers, so it can't post a
+ *      form or a text/plain body here with the browser's saved login
+ *      (CSRF). Else 400.
+ * ========================================================================== */
+
+/* Sets ctx->http_pw: CONFIG_ML_CONFIG_HTTPD_PASSWORD if set, else the one
+ * kept in NVS, else a new random one, which is then kept in NVS. A
+ * generated password is printed once per boot, so the user can always
+ * find it on the serial console. Called when the server starts: by then
+ * the WiFi radio, if used, is on and feeds esp_random()'s entropy. */
+static void http_pw_init(ml_config_ctx_t *ctx) {
+    static bool s_logged;   /* once per boot, not once per tailtiny_start() */
+#ifdef CONFIG_ML_CONFIG_HTTPD_PASSWORD
+    const char *cfg = CONFIG_ML_CONFIG_HTTPD_PASSWORD;
+#else
+    const char *cfg = "";
+#endif
+    memset(ctx->http_pw, 0, sizeof(ctx->http_pw));
+
+    if (cfg[0] != '\0') {
+        if (strlen(cfg) > HTTP_PW_MAXLEN) {
+            /* Fail closed: a long random password nobody knows */
+            for (int i = 0; i < 32; i++) ctx->http_pw[i] = (char)('a' + esp_random() % 26);
+            ESP_LOGE(TAG, "CONFIG_ML_CONFIG_HTTPD_PASSWORD is longer than %d characters: "
+                     "config UI locked", HTTP_PW_MAXLEN);
+            return;
+        }
+        strcpy(ctx->http_pw, cfg);
+        if (!s_logged) {
+            ESP_LOGI(TAG, "Config UI login: user \"admin\", password from "
+                     "CONFIG_ML_CONFIG_HTTPD_PASSWORD");
+        }
+        s_logged = true;
+        return;
+    }
+
+    const char *origin = "kept in NVS since first boot";
+    size_t len = sizeof(ctx->http_pw);
+    if (nvs_get_str(ctx->nvs, NVS_KEY_HTTP_PW, ctx->http_pw, &len) != ESP_OK ||
+        ctx->http_pw[0] == '\0') {
+        /* 16 characters from 49 letters and digits that are hard to mix
+         * up (no 0/O/o, 1/I/i/l, 2/Z, 5/S, 8/B): about 90 bits */
+        static const char alphabet[] = "abcdefghjkmnpqrstuvwxyzACDEFGHJKLMNPQRTUVWXY34679";
+        memset(ctx->http_pw, 0, sizeof(ctx->http_pw));
+        for (int i = 0; i < 16; i++) {
+            ctx->http_pw[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
+        }
+        if (nvs_set_str(ctx->nvs, NVS_KEY_HTTP_PW, ctx->http_pw) == ESP_OK &&
+            nvs_commit(ctx->nvs) == ESP_OK) {
+            origin = "generated now, kept in NVS";
+        } else {
+            origin = "could not be stored in NVS: a new one is made every boot";
+        }
+        s_logged = false;   /* a new password is always printed */
+    }
+    if (!s_logged) {
+        ESP_LOGW(TAG, "Config UI login: user \"admin\", password \"%s\" (%s; set "
+                 "CONFIG_ML_CONFIG_HTTPD_PASSWORD to choose one)", ctx->http_pw, origin);
+    }
+    s_logged = true;
+}
+
+/* The IPv4 address (host byte order) the request arrived on.
+ *
+ * With CONFIG_LWIP_IPV6 (ESP-IDF's default) esp_http_server listens on an
+ * AF_INET6 socket, and lwIP reports a connection that came in over IPv4
+ * as the IPv4-mapped address ::ffff:a.b.c.d, which is unwrapped here.
+ * Native IPv6 is refused: the device's tailnet address is IPv4 only, so a
+ * native IPv6 connection came in over a LAN or the carrier. */
+static bool request_local_ipv4(httpd_req_t *req, uint32_t *ip_out) {
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&ss, &sl) != 0) {
+        return false;
+    }
+    if (ss.ss_family == AF_INET) {
+        *ip_out = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+        return true;
+    }
+#if LWIP_IPV6
+    if (ss.ss_family == AF_INET6) {
+        return ml_config_ipv4_from_mapped(
+            (const uint8_t *)&((struct sockaddr_in6 *)&ss)->sin6_addr, ip_out);
+    }
+#endif
+    return false;
+}
+
+#ifdef CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
+/* esp_netif_find_if() predicate (runs in lwIP's context): a WiFi station
+ * or Ethernet interface whose own address is *arg (network byte order).
+ * The PPP (cellular) interface and the WiFi soft-AP never match. */
+static bool lan_netif_has_ip(esp_netif_t *netif, void *arg) {
+    const uint32_t want = *(const uint32_t *)arg;
+    if (esp_netif_get_flags(netif) & ESP_NETIF_FLAG_IS_PPP) return false;
+    const char *key = esp_netif_get_ifkey(netif);
+    const char *desc = esp_netif_get_desc(netif);
+    bool lan = (key && (strncmp(key, "WIFI_STA", 8) == 0 || strncmp(key, "ETH", 3) == 0)) ||
+               (desc && (strcmp(desc, "sta") == 0 || strncmp(desc, "eth", 3) == 0));
+    if (!lan || !esp_netif_is_netif_up(netif)) return false;
+    esp_netif_ip_info_t info;
+    if (esp_netif_get_ip_info(netif, &info) != ESP_OK) return false;
+    return info.ip.addr != 0 && info.ip.addr == want;
+}
+#endif
+
+/* Check 1: @p ip (host byte order) is the device's own VPN address, or,
+ * with ALLOW_LAN, a WiFi station / Ethernet interface's own address. */
+static bool local_addr_allowed(const ml_config_ctx_t *ctx, uint32_t ip) {
+    if (ip == 0) return false;
+    uint32_t vpn_ip = ctx->ml ? tailtiny_get_vpn_ip(ctx->ml) : 0;
+    if (vpn_ip != 0 && ip == vpn_ip) {
+        return true;
+    }
+#ifdef CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
+    uint32_t ip_be = htonl(ip);
+    return esp_netif_find_if(lan_netif_has_ip, &ip_be) != NULL;
+#else
+    return false;
+#endif
+}
+
+/* Runs the four checks above. Returns true if the request may go on;
+ * otherwise an error response has been sent and the handler returns. */
+static bool http_guard(httpd_req_t *req, bool mutating) {
+    const ml_config_ctx_t *ctx = (const ml_config_ctx_t *)req->user_ctx;
+
+    uint32_t local_ip = 0;
+    if (!request_local_ipv4(req, &local_ip) || !local_addr_allowed(ctx, local_ip)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Not available on this interface");
+        return false;
+    }
+
+    char host[64];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK ||
+        !ml_config_host_is_local_ip(host, local_ip)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Open the page by the device's IP address (http://100.x.y.z/)");
+        return false;
+    }
+
+    char auth[256];
+    bool auth_ok = httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK &&
+                   ml_config_basic_auth_ok(auth, ctx->http_pw);
+    ml_at_secure_zero(auth, sizeof(auth));
+    if (!auth_ok) {
+        /* Not httpd_resp_send_err(): a browser's first request always gets
+         * this, no need for a warning in the log every time. */
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"TailTiny\", charset=\"UTF-8\"");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "Authentication required");
+        return false;
+    }
+
+    if (mutating) {
+        char ct[64];
+        if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK ||
+            !ml_config_content_type_is_json(ct)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Type must be application/json");
+            return false;
+        }
+    }
+
+    httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return true;
 }
 
 /* ============================================================================
@@ -389,6 +687,7 @@ static char *read_post_body(httpd_req_t *req) {
 
 /* GET / — serve HTML config page */
 static esp_err_t handler_root(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, CONFIG_PAGE_HTML);
     return ESP_OK;
@@ -396,6 +695,7 @@ static esp_err_t handler_root(httpd_req_t *req) {
 
 /* GET /api/status */
 static esp_err_t handler_status(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
     tailtiny_t *ml = ctx->ml;
 
@@ -432,6 +732,7 @@ static esp_err_t handler_status(httpd_req_t *req) {
 
 /* GET /api/settings */
 static esp_err_t handler_get_settings(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     cJSON *json = cJSON_CreateObject();
@@ -445,8 +746,6 @@ static esp_err_t handler_get_settings(httpd_req_t *req) {
         ctx->settings.auth_key[0] ? "********" : "");
     cJSON_AddStringToObject(json, "device_prefix", ctx->settings.device_prefix);
     cJSON_AddStringToObject(json, "cellular_apn", ctx->settings.cellular_apn);
-    cJSON_AddStringToObject(json, "cellular_sim_pin",
-        ctx->settings.cellular_sim_pin[0] ? "****" : "");
     cJSON_AddStringToObject(json, "ppp_user", ctx->settings.ppp_user);
     cJSON_AddStringToObject(json, "ppp_pass",
         ctx->settings.ppp_pass[0] ? "********" : "");
@@ -468,6 +767,7 @@ static esp_err_t handler_get_settings(httpd_req_t *req) {
 
 /* POST /api/settings */
 static esp_err_t handler_post_settings(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     char *body = read_post_body(req);
@@ -481,6 +781,28 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
     if (!json) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
         return ESP_FAIL;
+    }
+
+    /* Check every field that reaches a modem AT command or the control
+     * connection BEFORE changing anything, so a refused request leaves
+     * the settings as they were. A value that is too long is refused, not
+     * cut short. A masked placeholder or an empty secret means "keep". */
+    {
+        const cJSON *it;
+        const char *bad = NULL;
+        const char *v;
+        #define STR_ITEM(name) (((it = cJSON_GetObjectItem(json, (name))) && cJSON_IsString(it)) \
+                                ? it->valuestring : NULL)
+        if (!bad && (v = STR_ITEM("cellular_apn"))) bad = check_cellular_apn(v);
+        if (!bad && (v = STR_ITEM("ppp_user"))) bad = check_ppp_user(v);
+        if (!bad && (v = STR_ITEM("ppp_pass")) && strcmp(v, "********") != 0) bad = check_ppp_pass(v);
+        if (!bad && (v = STR_ITEM("ctrl_host"))) bad = check_ctrl_host(v);
+        #undef STR_ITEM
+        if (bad) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, bad);
+            return ESP_FAIL;
+        }
     }
 
     /* Helper macro: clear field, copy new value, ensure null termination */
@@ -514,12 +836,8 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
     if ((item = cJSON_GetObjectItem(json, "cellular_apn")) && cJSON_IsString(item)) {
         COPY_STR_FIELD(ctx->settings.cellular_apn, item->valuestring);
     }
-    if ((item = cJSON_GetObjectItem(json, "cellular_sim_pin")) && cJSON_IsString(item)) {
-        const char *v = item->valuestring;
-        if (v[0] != '\0' && strcmp(v, "****") != 0) {
-            COPY_STR_FIELD(ctx->settings.cellular_sim_pin, v);
-        }
-    }
+    /* "cellular_sim_pin" is ignored: nothing used it (see
+     * config_sanitize_settings()). */
     if ((item = cJSON_GetObjectItem(json, "ppp_user")) && cJSON_IsString(item)) {
         COPY_STR_FIELD(ctx->settings.ppp_user, item->valuestring);
     }
@@ -563,6 +881,7 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
 
 /* GET /api/peers — all known peers with status */
 static esp_err_t handler_get_peers(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
     tailtiny_t *ml = ctx->ml;
 
@@ -595,6 +914,7 @@ static esp_err_t handler_get_peers(httpd_req_t *req) {
 
 /* GET /api/peers/allowed — current allowlist */
 static esp_err_t handler_get_allowed(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     cJSON *json = cJSON_CreateObject();
@@ -620,6 +940,7 @@ static esp_err_t handler_get_allowed(httpd_req_t *req) {
 
 /* POST /api/peers/allowed — replace allowlist */
 static esp_err_t handler_post_allowed(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     char *body = read_post_body(req);
@@ -681,6 +1002,7 @@ static esp_err_t handler_post_allowed(httpd_req_t *req) {
 
 /* DELETE /api/peers/allowed — clear allowlist */
 static esp_err_t handler_delete_allowed(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     if (xSemaphoreTake(ctx->peer_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -700,6 +1022,7 @@ static esp_err_t handler_delete_allowed(httpd_req_t *req) {
 
 /* GET /api/monitor — temperature, RSSI, uptime, task stack watermarks */
 static esp_err_t handler_monitor(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
     tailtiny_t *ml = ctx->ml;
 
@@ -788,6 +1111,7 @@ static esp_err_t handler_monitor(httpd_req_t *req) {
 
 /* POST /api/restart */
 static esp_err_t handler_restart(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"restarting\":true}");
 
@@ -803,6 +1127,7 @@ static esp_err_t handler_restart(httpd_req_t *req) {
 
 /* GET /api/wifi — return WiFi list with masked passwords */
 static esp_err_t handler_get_wifi(httpd_req_t *req) {
+    if (!http_guard(req, false)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     cJSON *json = cJSON_CreateObject();
@@ -825,6 +1150,7 @@ static esp_err_t handler_get_wifi(httpd_req_t *req) {
 
 /* POST /api/wifi — replace entire WiFi list */
 static esp_err_t handler_post_wifi(httpd_req_t *req) {
+    if (!http_guard(req, true)) return ESP_OK;
     ml_config_ctx_t *ctx = (ml_config_ctx_t *)req->user_ctx;
 
     char *body = read_post_body(req);
@@ -928,6 +1254,7 @@ bool ml_config_get_wifi_list(ml_config_wifi_list_t *list) {
         if (read_len > sizeof(ml_config_wifi_list_t)) read_len = sizeof(ml_config_wifi_list_t);
         err = nvs_get_blob(nvs, NVS_KEY_WIFI, list, &read_len);
         if (err == ESP_OK && list->count > 0 && list->count <= ML_CONFIG_MAX_WIFI_ENTRIES) {
+            terminate_wifi_list_strings(list);
             nvs_close(nvs);
             return true;
         }
@@ -937,23 +1264,26 @@ bool ml_config_get_wifi_list(ml_config_wifi_list_t *list) {
     }
 
     /* Fall back to settings blob WiFi (heap-alloc to avoid stack overflow) */
-    ml_config_settings_t *settings = heap_caps_malloc(sizeof(*settings), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* PSRAM if there is any, else internal RAM: PSRAM-only allocations failed
+     * on chips without it (the C3), so settings saved in this UI were never used */
+    ml_config_settings_t *settings = ml_psram_malloc(sizeof(*settings));
     if (!settings) { nvs_close(nvs); return false; }
     memset(settings, 0, sizeof(*settings));
     size_t slen = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &slen);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err == ESP_OK && settings->wifi_ssid[0] != '\0') {
         list->count = 1;
         list->active_idx = 0;
         strncpy(list->entries[0].ssid, settings->wifi_ssid, 32);
         strncpy(list->entries[0].pass, settings->wifi_pass, 64);
-        free(settings);
+        free_settings(settings);
         return true;
     }
 
-    free(settings);
+    free_settings(settings);
     return false;
 }
 
@@ -964,7 +1294,7 @@ bool ml_config_get_wifi_list(ml_config_wifi_list_t *list) {
 bool ml_config_get_nvs_wifi(char *ssid, size_t ssid_len,
                              char *pass, size_t pass_len) {
     /* Heap-allocate to avoid stack overflow in app_main (1570+400 bytes) */
-    ml_config_wifi_list_t *wlist = heap_caps_malloc(sizeof(*wlist), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ml_config_wifi_list_t *wlist = ml_psram_malloc(sizeof(*wlist));
     if (wlist && ml_config_get_wifi_list(wlist) && wlist->count > 0) {
         if (ssid && ssid_len > 0) {
             strncpy(ssid, wlist->entries[0].ssid, ssid_len - 1);
@@ -975,9 +1305,11 @@ bool ml_config_get_nvs_wifi(char *ssid, size_t ssid_len,
             pass[pass_len - 1] = '\0';
         }
         ESP_LOGI(TAG, "WiFi from wifi_list[0]: %s", wlist->entries[0].ssid);
+        ml_at_secure_zero(wlist, sizeof(*wlist));
         free(wlist);
         return true;
     }
+    if (wlist) ml_at_secure_zero(wlist, sizeof(*wlist));
     free(wlist);  /* NULL-safe */
 
     /* Fall back to settings blob */
@@ -985,15 +1317,16 @@ bool ml_config_get_nvs_wifi(char *ssid, size_t ssid_len,
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err != ESP_OK) return false;
 
-    ml_config_settings_t *settings = heap_caps_malloc(sizeof(*settings), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ml_config_settings_t *settings = ml_psram_malloc(sizeof(*settings));
     if (!settings) { nvs_close(nvs); return false; }
     memset(settings, 0, sizeof(*settings));
     size_t len = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &len);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err != ESP_OK || len < 1 || settings->version < 1 || settings->wifi_ssid[0] == '\0') {
-        free(settings);
+        free_settings(settings);
         return false;
     }
 
@@ -1007,7 +1340,7 @@ bool ml_config_get_nvs_wifi(char *ssid, size_t ssid_len,
     }
 
     ESP_LOGI(TAG, "WiFi from settings: %s", settings->wifi_ssid);
-    free(settings);
+    free_settings(settings);
     return true;
 }
 
@@ -1017,15 +1350,23 @@ bool ml_config_get_nvs_ppp(char *user, size_t user_len,
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err != ESP_OK) return false;
 
-    ml_config_settings_t *settings = heap_caps_malloc(sizeof(*settings), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ml_config_settings_t *settings = ml_psram_malloc(sizeof(*settings));
     if (!settings) { nvs_close(nvs); return false; }
     memset(settings, 0, sizeof(*settings));
     size_t len = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &len);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err != ESP_OK || len < 1 || settings->version < 3 || settings->ppp_user[0] == '\0') {
-        free(settings);
+        free_settings(settings);
+        return false;
+    }
+    /* Saved by older firmware without checks: never hand the modem a
+     * value that could end the AT command (the caller uses Kconfig). */
+    if (check_ppp_user(settings->ppp_user) || check_ppp_pass(settings->ppp_pass)) {
+        ESP_LOGW(TAG, "Ignoring invalid PPP credentials in NVS");
+        free_settings(settings);
         return false;
     }
 
@@ -1039,7 +1380,7 @@ bool ml_config_get_nvs_ppp(char *user, size_t user_len,
     }
 
     ESP_LOGI(TAG, "PPP credentials from NVS: user=%s", settings->ppp_user);
-    free(settings);
+    free_settings(settings);
     return true;
 }
 
@@ -1048,15 +1389,21 @@ bool ml_config_get_nvs_apn(char *apn, size_t apn_len) {
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err != ESP_OK) return false;
 
-    ml_config_settings_t *settings = heap_caps_malloc(sizeof(*settings), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ml_config_settings_t *settings = ml_psram_malloc(sizeof(*settings));
     if (!settings) { nvs_close(nvs); return false; }
     memset(settings, 0, sizeof(*settings));
     size_t len = sizeof(*settings);
     err = nvs_get_blob(nvs, NVS_KEY_SETTINGS, settings, &len);
     nvs_close(nvs);
+    terminate_settings_strings(settings);
 
     if (err != ESP_OK || len < 1 || settings->cellular_apn[0] == '\0') {
-        free(settings);
+        free_settings(settings);
+        return false;
+    }
+    if (check_cellular_apn(settings->cellular_apn)) {
+        ESP_LOGW(TAG, "Ignoring invalid APN in NVS");
+        free_settings(settings);
         return false;
     }
 
@@ -1066,7 +1413,7 @@ bool ml_config_get_nvs_apn(char *apn, size_t apn_len) {
     }
 
     ESP_LOGI(TAG, "APN from NVS: %s", settings->cellular_apn);
-    free(settings);
+    free_settings(settings);
     return true;
 }
 
@@ -1117,6 +1464,10 @@ esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, tailtiny_t *ml) {
     if (!ctx) return ESP_ERR_INVALID_ARG;
     ctx->ml = ml;
 
+    http_pw_init(ctx);
+
+    /* The socket listens on every interface (the VPN address isn't known
+     * yet and can change); http_guard() answers only on the allowed ones. */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 6144;
     config.max_uri_handlers = 14;
@@ -1148,7 +1499,12 @@ esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, tailtiny_t *ml) {
         httpd_register_uri_handler(ctx->httpd, &uris[i]);
     }
 
-    ESP_LOGI(TAG, "HTTP config server started on port %d", config.server_port);
+#ifdef CONFIG_ML_CONFIG_HTTPD_ALLOW_LAN
+    ESP_LOGI(TAG, "HTTP config server started on port %d (VPN and WiFi/Ethernet address)",
+             config.server_port);
+#else
+    ESP_LOGI(TAG, "HTTP config server started on port %d (VPN address only)", config.server_port);
+#endif
     return ESP_OK;
 }
 
@@ -1172,6 +1528,8 @@ void ml_config_httpd_deinit(ml_config_ctx_t *ctx) {
 #endif
     if (ctx->nvs) nvs_close(ctx->nvs);
     if (ctx->peer_mutex) vSemaphoreDelete(ctx->peer_mutex);
+    /* Holds the UI password, auth key and WiFi passwords */
+    ml_at_secure_zero(ctx, sizeof(*ctx));
     free(ctx);
 }
 

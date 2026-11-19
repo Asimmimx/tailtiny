@@ -13,6 +13,7 @@
  */
 
 #include "ml_cellular.h"
+#include "ml_at_validate.h"
 #include "tailtiny_internal.h"
 
 #include "esp_log.h"
@@ -85,7 +86,7 @@ static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int ti
     snprintf(cmd_buf, sizeof(cmd_buf), "%s\r\n", cmd);
     uart_write_bytes(UART_NUM, cmd_buf, strlen(cmd_buf));
 
-    ESP_LOGD(TAG, ">> %s", cmd);
+    ESP_LOGD(TAG, ">> %s", (strstr(cmd, "+CPIN=") || strstr(cmd, "+CGAUTH=")) ? "(command with credentials)" : cmd);
 
     int total_read = 0;
     int64_t start = esp_timer_get_time();
@@ -117,7 +118,9 @@ static int at_send_cmd(const char *cmd, char *response, size_t resp_size, int ti
         while (*display == '\r' || *display == '\n') display++;
         ESP_LOGD(TAG, "<< %s", display);
     } else {
-        ESP_LOGW(TAG, "<< (no response to '%s')", cmd);
+        /* Not the command itself when it carries the SIM PIN or the PPP login */
+        bool secret = strstr(cmd, "+CPIN=") || strstr(cmd, "+CGAUTH=");
+        ESP_LOGW(TAG, "<< (no response to '%s')", secret ? "(command with credentials)" : cmd);
         return -1;
     }
 
@@ -314,6 +317,13 @@ static esp_err_t sim_setup(void)
     } else if (strstr(resp, "SIM PIN")) {
         /* Try to unlock with PIN */
         if (s_cell.config.sim_pin && s_cell.config.sim_pin[0]) {
+            /* Checked in ml_cellular_init() too: never put an unchecked
+             * value into an AT command. */
+            if (!ml_at_valid_pin(s_cell.config.sim_pin)) {
+                ESP_LOGE(TAG, "SIM PIN is not 4-8 digits; not sending it");
+                s_cell.state = ML_CELL_STATE_ERROR;
+                return ESP_ERR_INVALID_ARG;
+            }
             char pin_cmd[64];
             snprintf(pin_cmd, sizeof(pin_cmd), "AT+CPIN=\"%s\"", s_cell.config.sim_pin);
             if (at_cmd_ok(pin_cmd, AT_TIMEOUT_MS)) {
@@ -591,6 +601,13 @@ static esp_err_t ppp_setup_and_dial(void)
     {
         const char *apn = (s_cell.config.apn && s_cell.config.apn[0])
                           ? s_cell.config.apn : "";
+        /* Checked again where it goes into the command: a '"' or CR/LF
+         * would let the value run any AT command (ml_cellular_init()
+         * checks too). <= 100 characters, so the command fits. */
+        if (!ml_at_valid_apn(apn)) {
+            ESP_LOGE(TAG, "Invalid APN; refusing to dial");
+            return ESP_ERR_INVALID_ARG;
+        }
         char cgdcont_cmd[128];
         snprintf(cgdcont_cmd, sizeof(cgdcont_cmd),
                  "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
@@ -612,9 +629,20 @@ static esp_err_t ppp_setup_and_dial(void)
     {
         /* Auth type: 0=none, 1=PAP, 2=CHAP */
         int auth_type = (ppp_user[0] || ppp_pass[0]) ? 2 : 1;  /* CHAP if creds, PAP if empty */
+        /* Same for the PPP login (checked in ml_cellular_init() too) */
+        if (!ml_at_valid_credential(ppp_user) || !ml_at_valid_credential(ppp_pass)) {
+            ESP_LOGE(TAG, "Invalid PPP credentials; refusing to dial");
+            return ESP_ERR_INVALID_ARG;
+        }
         char auth_cmd[128];
-        snprintf(auth_cmd, sizeof(auth_cmd),
-                 "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_user, ppp_pass);
+        int auth_len = snprintf(auth_cmd, sizeof(auth_cmd),
+                                "AT+CGAUTH=1,%d,\"%s\",\"%s\"", auth_type, ppp_user, ppp_pass);
+        if (auth_len < 0 || (size_t)auth_len >= sizeof(auth_cmd)) {
+            /* Cut short, the command would lose its closing quote */
+            ESP_LOGE(TAG, "PPP user name and password too long together "
+                     "(max %d characters); refusing to dial", (int)sizeof(auth_cmd) - 20);
+            return ESP_ERR_INVALID_ARG;
+        }
         at_cmd_ok(auth_cmd, AT_TIMEOUT_MS);
     }
     if (ppp_user[0] || ppp_pass[0]) {
@@ -797,6 +825,27 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
     } else {
         ml_cellular_config_t def = ML_CELLULAR_DEFAULT_CONFIG();
         s_cell.config = def;
+    }
+
+    /* Refuse values that can't go safely inside an AT command. Kconfig,
+     * the web UI's NVS settings and the application's config all arrive
+     * here; checked before the modem is touched, so the state stays OFF. */
+    {
+        const char *bad = NULL;
+        if (s_cell.config.apn && !ml_at_valid_apn(s_cell.config.apn)) {
+            bad = "APN (letters, digits, '-' and '.', max 100)";
+        } else if (s_cell.config.sim_pin && s_cell.config.sim_pin[0] &&
+                   !ml_at_valid_pin(s_cell.config.sim_pin)) {
+            bad = "SIM PIN (4-8 digits)";
+        } else if (s_cell.config.ppp_user && !ml_at_valid_credential(s_cell.config.ppp_user)) {
+            bad = "PPP user (printable ASCII without '\"' or '\\', max 64)";
+        } else if (s_cell.config.ppp_pass && !ml_at_valid_credential(s_cell.config.ppp_pass)) {
+            bad = "PPP password (printable ASCII without '\"' or '\\', max 64)";
+        }
+        if (bad) {
+            ESP_LOGE(TAG, "Invalid cellular config: %s", bad);
+            return ESP_ERR_INVALID_ARG;
+        }
     }
 
     if (s_cell.config.tx_pin == 0) s_cell.config.tx_pin = 43;

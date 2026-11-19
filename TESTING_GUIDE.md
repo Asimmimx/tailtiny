@@ -9,6 +9,22 @@ This guide covers hardware setup, building, flashing, and testing TailTiny examp
   - Generate a **reusable + ephemeral** key for development
 - **USB-C cable** for flashing
 
+## Host Tests (no hardware)
+
+These run on a PC with Python 3 and gcc (MinGW on Windows works); the CI runs them on every push. Some need lwIP's headers (`LWIP_INCLUDE_DIR`, or ESP-IDF's copy under `IDF_PATH`) and Python's `cryptography` package.
+
+```bash
+python tests/host/run_tests.py               # MapResponse JSON stripping and peer iteration
+python tests/host/check_wg_locking.py        # WireGuard state only under its lock
+python tests/host/check_noise_aead.py        # Noise ChaCha20-Poly1305 against RFC 8439
+python tests/host/check_idle_wait.py         # idle waits (the eventfd part runs on Linux only)
+python tests/host/check_tai64n.py            # WireGuard handshake timestamps
+python tests/host/check_wg_roaming.py        # WireGuard receive path: roaming, replay, cookie reply
+python tests/host/check_x25519.py            # both X25519 copies against RFC 7748
+python tests/host/check_coord_robustness.py  # control-plane parsing, partial reads, NVS peer cache
+python tests/host/check_config_guard.py      # config web UI login/Host checks, AT parameter checks
+```
+
 ## Hardware Options
 
 ### Option A: XIAO ESP32S3 + Waveshare SIM7600X (Separate Boards)

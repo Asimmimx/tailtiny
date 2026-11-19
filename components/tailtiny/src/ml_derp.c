@@ -219,37 +219,49 @@ static int derp_tls_write_all(tailtiny_t *ml, const uint8_t *data, size_t len) {
     return (int)written;
 }
 
-/* Write a complete DERP frame via TLS */
+/* The 5-byte DERP frame header: 1 type + 4 length (big-endian) */
+static void derp_frame_header(uint8_t *h, uint8_t type, uint32_t len) {
+    h[0] = type;
+    h[1] = (len >> 24) & 0xFF;
+    h[2] = (len >> 16) & 0xFF;
+    h[3] = (len >> 8) & 0xFF;
+    h[4] = len & 0xFF;
+}
+
+/* Write a complete DERP frame via TLS, header and payload in one TLS record.
+ * As two records, the second (the payload) sat in the TCP stack until the
+ * relay acknowledged the first (Nagle), so every relayed packet waited a
+ * round trip; espkvm measured the relay at about 60 KB/s that way. */
 static int derp_write_frame(tailtiny_t *ml, uint8_t type,
                              const uint8_t *payload, uint32_t len) {
-    /* 5-byte header: 1 type + 4 length (big-endian) */
-    uint8_t header[5];
-    header[0] = type;
-    header[1] = (len >> 24) & 0xFF;
-    header[2] = (len >> 16) & 0xFF;
-    header[3] = (len >> 8) & 0xFF;
-    header[4] = len & 0xFF;
-
-    if (derp_tls_write_all(ml, header, 5) < 0) return -1;
-
-    if (len > 0 && payload) {
-        if (derp_tls_write_all(ml, payload, len) < 0) return -1;
+    if (len == 0 || !payload) {
+        uint8_t header[5];
+        derp_frame_header(header, type, 0);
+        return derp_tls_write_all(ml, header, 5) < 0 ? -1 : 0;
     }
-    return 0;
+    uint8_t *frame = malloc(5 + (size_t)len);
+    if (!frame) return -1;
+    derp_frame_header(frame, type, len);
+    memcpy(frame + 5, payload, len);
+    int ret = derp_tls_write_all(ml, frame, 5 + (size_t)len) < 0 ? -1 : 0;
+    free(frame);
+    return ret;
 }
 
 /* Send a packet to a peer via DERP */
 static int derp_send_packet(tailtiny_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len) {
-    /* SendPacket frame: 32-byte dest key + payload */
+    /* SendPacket frame: header, 32-byte dest key, payload: built in one
+     * buffer and written as one TLS record (see derp_write_frame) */
     size_t frame_len = 32 + len;
-    uint8_t *frame = malloc(frame_len);
+    uint8_t *frame = malloc(5 + frame_len);
     if (!frame) return -1;
 
-    memcpy(frame, dest_key, 32);
-    memcpy(frame + 32, data, len);
+    derp_frame_header(frame, DERP_FRAME_SEND_PACKET, (uint32_t)frame_len);
+    memcpy(frame + 5, dest_key, 32);
+    memcpy(frame + 5 + 32, data, len);
 
-    int ret = derp_write_frame(ml, DERP_FRAME_SEND_PACKET, frame, frame_len);
+    int ret = derp_tls_write_all(ml, frame, 5 + frame_len) < 0 ? -1 : 0;
     if (ret < 0) {
         ESP_LOGW(TAG, "derp_send_packet FAILED: dest=%02x%02x%02x%02x len=%d",
                  dest_key[0], dest_key[1], dest_key[2], dest_key[3], (int)len);
@@ -425,8 +437,14 @@ static int poll_derp_read(tailtiny_t *ml) {
         total_read += n;
     }
 
-    /* For RecvPacket (0x05): first 32 bytes are sender's public key */
-    if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
+    /* For RecvPacket (0x05): first 32 bytes are sender's public key. One with
+     * no room for a key and a packet is dropped: it went on with an all-zero
+     * key and the key bytes as the packet. */
+    if (frame_type == DERP_FRAME_RECV_PACKET && len <= 32) {
+        free(buf);
+        return 1;
+    }
+    if (frame_type == DERP_FRAME_RECV_PACKET) {
         memcpy(src_key, buf, 32);
         payload = malloc(len - 32);
         if (payload) {
@@ -1085,6 +1103,11 @@ esp_err_t ml_derp_connect(tailtiny_t *ml) {
         struct timeval io_tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 100ms */
         ml_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &io_tv, sizeof(io_tv));
         ml_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &io_tv, sizeof(io_tv));
+        /* No Nagle: every relayed packet is latency-sensitive, and a small
+         * write waited for the relay's ACK of the previous one. (Ignored on
+         * a cellular AT socket.) */
+        int one = 1;
+        ml_setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     }
 
     /* ========================================================

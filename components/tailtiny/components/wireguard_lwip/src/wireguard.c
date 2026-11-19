@@ -320,7 +320,9 @@ static void wireguard_kdf3(uint8_t *tau1, uint8_t *tau2, uint8_t *tau3, const ui
 bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 	// Implementation of packet replay window - as per RFC2401
 	// Adapted from code in Appendix C at https://tools.ietf.org/html/rfc2401
-	uint32_t diff;
+	// 64 bits like the counters: a uint32_t difference wrapped, and a packet
+	// 2^32 + n behind the newest one looked n behind (still in the window).
+	uint64_t diff;
 	bool result = false;
 	size_t ReplayWindowSize = sizeof(keypair->replay_bitmap) * CHAR_BIT; // 32 bits
 
@@ -389,13 +391,14 @@ static uint32_t wireguard_generate_unique_index(struct wireguard_device *device)
 		} while ((result == 0) || (result == 0xFFFFFFFF)); // Don't allow 0 or 0xFFFFFFFF as valid values
 
 		existing = false;
-		for (x=0; x < WIREGUARD_MAX_PEERS; x++) {
+		// Every peer slot: the loop used to overwrite the result each time,
+		// so only the last slot was checked and two sessions could share an index.
+		for (x=0; x < WIREGUARD_MAX_PEERS && !existing; x++) {
 			peer = &device->peers[x];
 			existing = (result == peer->curr_keypair.local_index) ||
 					(result == peer->prev_keypair.local_index) ||
 					(result == peer->next_keypair.local_index) ||
 					(result == peer->handshake.local_index);
-
 		}
 	} while (existing);
 
@@ -472,6 +475,7 @@ static void add_new_keypair(struct wireguard_peer *peer, struct wireguard_keypai
 		peer->next_keypair =  new_keypair;
 		keypair_destroy(&peer->prev_keypair);
 	}
+	crypto_zero(&new_keypair, sizeof(new_keypair));
 }
 
 void wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
@@ -502,6 +506,7 @@ void wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
 	new_keypair.last_rx = 0; // No packets received yet
 
 	new_keypair.valid = true;
+	peer->last_session_millis = new_keypair.keypair_millis ? new_keypair.keypair_millis : 1;
 
 	// Eprivi = Epubi = Eprivr = Epubr = Ci = Cr := E
 	crypto_zero(handshake->ephemeral_private, WIREGUARD_PUBLIC_KEY_LEN);
@@ -513,6 +518,8 @@ void wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
 	handshake->valid = false;
 
 	add_new_keypair(peer, new_keypair);
+	// The session keys' stack copy (add_new_keypair() wipes its own)
+	crypto_zero(&new_keypair, sizeof(new_keypair));
 }
 
 uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {

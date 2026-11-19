@@ -122,6 +122,12 @@ static void update_peer_addr(struct wireguard_peer *peer, const ip_addr_t *addr,
 		WG_DEBUG("[WG] update_peer_addr: skipping DERP (0.0.0.0)\n");
 		return;  // Skip updating endpoint for DERP packets
 	}
+	// A packet can reach the WireGuard port through the tunnel itself (the
+	// DISCO socket listens on every interface), from a tailnet address. Roaming
+	// there would send each packet back into this interface, without end.
+	if (!IP_IS_V4(addr) || !wireguardif_endpoint_ip4_ok(ip4_addr_get_u32(ip_2_ip4(addr)))) {
+		return;
+	}
 	WG_DEBUG("[WG] update_peer_addr: %s:%u\n", ipaddr_ntoa(addr), port);
 	peer->ip = *addr;
 	peer->port = port;
@@ -382,7 +388,8 @@ static err_t wireguardif_seal_locked(struct wireguard_peer *peer, struct pbuf *q
 		// No valid keys! As wireguard-go does for a packet with no session, ask
 		// the timers for a handshake (sent within one WireGuard task round). While
 		// one is already being retried, its REKEY_ATTEMPT_TIME window is kept.
-		if (!peer->handshake_attempting) {
+		// Data only (q): a keepalive is not traffic, and must not reopen that window.
+		if (q && !peer->handshake_attempting) {
 			peer->active = true;
 			peer->send_handshake = true;
 		}
@@ -556,12 +563,17 @@ static void wireguardif_process_data_message_locked(struct wireguard_device *dev
 	if (keypair) {
 		if (
 				(keypair->receiving_valid) &&
-				!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) &&
-				(keypair->sending_counter < REJECT_AFTER_MESSAGES)
+				!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME)
 
 		) {
 
 			nonce = U8TO64_LITTLE(data_hdr->counter);
+			// Reject-After-Messages applies to the received counter. This compared our
+			// sending counter, and destroyed the keypair for it. The counter isn't
+			// authenticated yet here, so only this packet is dropped.
+			if (nonce >= REJECT_AFTER_MESSAGES) {
+				return;
+			}
 			src = &data_hdr->enc_packet[0];
 			src_len = data_len;
 
@@ -609,7 +621,10 @@ static void wireguardif_process_data_message_locked(struct wireguard_device *dev
 							// 4b. Otherwise, WireGuard checks to see if the source IP address of the plaintext inner-packet routes correspondingly in the cryptokey routing table
 							// Also check packet length!
 #if LWIP_IPV4
-							if (IPH_V(iphdr) == 4) {
+							// Only a whole IPv4 header is parsed: a peer's 1-19 byte plaintext
+							// starting with 0x4_ was read past its end for the source address
+							// and length (smartalock/wireguard-lwip GHSA-7grw-r329-8g8c, issue 3).
+							if (pbuf->tot_len >= IP_HLEN && IPH_V(iphdr) == 4) {
 								// Check SOURCE IP (where packet came from) against peer's allowed IPs
 								// This is cryptokey routing: verify the inner packet source matches
 								// what this peer is allowed to send as.
@@ -642,13 +657,10 @@ static void wireguardif_process_data_message_locked(struct wireguard_device *dev
 								}
 							}
 #endif /* LWIP_IPV4 */
-#if LWIP_IPV6
-							if (IPH_V(iphdr) == 6) {
-								// TODO: IPV6 support for route filtering
-								header_len = PP_NTOHS(IPH_LEN(iphdr));
-								dest_ok = true;
-							}
-#endif /* LWIP_IPV6 */
+							// Inner IPv6 is dropped (dest_ok stays false). TailTiny's tunnel is
+							// IPv4-only and no peer has an IPv6 allowed IP, but this accepted any
+							// IPv6 packet without a source check, and read its length from the
+							// IPv4 header's position (fugo101/wireguard-lwip GHSA-335q-jvfv-r737).
 							if (header_len <= pbuf->tot_len) {
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
@@ -945,12 +957,13 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 			WG_LOCK(device);
 			peer = peer_lookup_by_handshake(device, msg_cookie->receiver);
 			if (peer) {
-				if (wireguard_process_cookie_message(device, peer, msg_cookie)) {
-					// Update the peer location
-					update_peer_addr(peer, addr, port);
-
-					// Don't send anything out - we stay quiet until the next initiation message
-				}
+				// Only the cookie is stored (whitepaper 5.4.7). The endpoint stays where
+				// it is: a cookie reply is sealed with a key derived from the peer's
+				// public key and the initiation's mac1, which went out in clear, so
+				// anyone who saw one initiation can forge one from any address
+				// (smartalock/wireguard-lwip GHSA-7grw-r329-8g8c, upstream #46).
+				// Don't send anything out - we stay quiet until the next initiation message
+				(void)wireguard_process_cookie_message(device, peer, msg_cookie);
 			}
 			WG_UNLOCK(device);
 			break;
@@ -1153,6 +1166,10 @@ void wireguardif_free_device(struct netif *netif) {
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port) {
 	struct wireguard_peer *peer;
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	// Never an address that routes back into this interface (see wireguardif.h)
+	if (!IP_IS_V4(ip) || !wireguardif_endpoint_ip4_ok(ip4_addr_get_u32(ip_2_ip4(ip)))) {
+		return ERR_ARG;
+	}
 	WG_LOCK(device);
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
@@ -1209,6 +1226,12 @@ err_t wireguardif_add_peer(struct netif *netif, struct wireguardif_peer *p, u8_t
 
 					peer->connect_ip = p->endpoint_ip;
 					peer->connect_port = p->endport_port;
+					if (!ip_addr_isany(&p->endpoint_ip) &&
+							(!IP_IS_V4(&p->endpoint_ip) || !wireguardif_endpoint_ip4_ok(ip4_addr_get_u32(ip_2_ip4(&p->endpoint_ip))))) {
+						// Not an address a packet may go to (see wireguardif.h): DERP
+						ip_addr_set_any(false, &peer->connect_ip);
+						peer->connect_port = 0;
+					}
 					peer->ip = peer->connect_ip;
 					peer->port = peer->connect_port;
 					if (p->keep_alive == WIREGUARDIF_KEEPALIVE_DEFAULT) {
@@ -1279,7 +1302,11 @@ static bool should_send_initiation(struct wireguard_peer *peer) {
 static bool should_send_keepalive(struct wireguard_peer *peer) {
 	bool result = false;
 	if (peer->keepalive_interval > 0) {
-		if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
+		// Only with a session to send it on. With just the previous keypair
+		// left (the current one expired), a keepalive was due on every tick,
+		// found no key, and asked for a new handshake each time: that undid
+		// the REKEY_ATTEMPT_TIME limit below for a peer that had gone away.
+		if (peer->curr_keypair.valid) {
 			if (wireguard_expired(peer->last_tx, peer->keepalive_interval)) {
 				result = true;
 			}
@@ -1299,18 +1326,19 @@ static bool should_destroy_current_keypair(struct wireguard_peer *peer) {
 	return result;
 }
 
+// Whitepaper 6.3: no new session for 3 x REJECT_AFTER_TIME, so all session
+// state goes. This tested the current keypair's age, but that keypair is
+// destroyed at REJECT_AFTER_TIME, so the reset never happened and old keys
+// (and a handshake's ephemeral key) stayed in RAM
+// (smartalock/wireguard-lwip GHSA-7grw-r329-8g8c, issue 6).
 static bool should_reset_peer(struct wireguard_peer *peer) {
-	bool result = false;
-	if (peer->curr_keypair.valid && (wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME * 3))) {
-		result = true;
-	}
-	return result;
+	return peer->last_session_millis != 0 &&
+			wireguard_expired(peer->last_session_millis, REJECT_AFTER_TIME * 3);
 }
 
 // The timers' work, shared by wireguardif_tmr() and wireguardif_periodic().
 // Decisions and key changes under the device lock; sends and the link change after it.
 static void wireguardif_run_timers(struct wireguard_device *device) {
-	bool link_up = false;
 	for (int x = 0; x < WIREGUARD_MAX_PEERS; x++) {
 		struct wireguard_peer *peer = &device->peers[x];
 		bool keepalive = false, initiate = false;
@@ -1322,7 +1350,9 @@ static void wireguardif_run_timers(struct wireguard_device *device) {
 				keypair_destroy(&peer->next_keypair);
 				keypair_destroy(&peer->curr_keypair);
 				keypair_destroy(&peer->prev_keypair);
-				// TODO: Also destroy handshake?
+				// The handshake too: it holds our ephemeral private key
+				crypto_zero(&peer->handshake, sizeof(peer->handshake));
+				peer->last_session_millis = 0;
 
 				// Revert back to default IP/port if these were altered
 				peer->ip = peer->connect_ip;
@@ -1331,6 +1361,16 @@ static void wireguardif_run_timers(struct wireguard_device *device) {
 			if (should_destroy_current_keypair(peer)) {
 				// Destroy current keypair
 				keypair_destroy(&peer->curr_keypair);
+			}
+			// The previous and next keypairs expire on their own clock too. They
+			// were only destroyed when replaced, so after a rekey the previous
+			// one stayed "valid" for good: the peer counted as up, and
+			// keepalives kept asking for handshakes after it had gone away.
+			if (peer->prev_keypair.valid && wireguard_expired(peer->prev_keypair.keypair_millis, REJECT_AFTER_TIME)) {
+				keypair_destroy(&peer->prev_keypair);
+			}
+			if (peer->next_keypair.valid && wireguard_expired(peer->next_keypair.keypair_millis, REJECT_AFTER_TIME)) {
+				keypair_destroy(&peer->next_keypair);
 			}
 			if (peer->curr_keypair.valid) {
 				peer->handshake_attempting = false;
@@ -1369,17 +1409,14 @@ static void wireguardif_run_timers(struct wireguard_device *device) {
 		if (initiate) {
 			wireguard_start_handshake(device->netif, peer);
 		}
-		WG_LOCK(device);
-		if (peer->valid && ((peer->curr_keypair.valid) || (peer->prev_keypair.valid))) {
-			link_up = true;
-		}
-		WG_UNLOCK(device);
 	}
-
-	if (!link_up) {
-		// Clear the IF-UP flag on netif
-		wg_netif_set_link(device->netif, false);
-	}
+	// The link is no longer taken down when no peer has a session. lwIP's
+	// routing skips a netif whose link is down, so a packet for a 100.x
+	// address from an ordinary socket (MQTT, an HTTP client) then went out the
+	// WiFi default route in clear, and never reached wireguardif_output() to
+	// start a handshake. TailTiny brings the link up when it attaches the netif
+	// (ml_wg_mgr.c) and it stays up; with no session, wireguardif_output()
+	// asks for a handshake and drops the packet, as wireguard-go does.
 }
 
 static void wireguardif_tmr(void *arg) {

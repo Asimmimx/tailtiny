@@ -191,6 +191,10 @@ struct wireguard_peer {
 	// newHandshake timer): after KEEPALIVE_TIMEOUT + REKEY_TIMEOUT, a new handshake.
 	bool data_unanswered;
 	uint32_t data_unanswered_since;
+
+	// When the last session was made (0: none since the last reset). After
+	// 3 x REJECT_AFTER_TIME without a new one, all session state is wiped.
+	uint32_t last_session_millis;
 };
 
 struct wireguard_device {

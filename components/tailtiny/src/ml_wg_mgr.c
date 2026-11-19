@@ -113,23 +113,26 @@ static inline bool is_lan_ip(uint32_t ip) {
            (((ip >> 16) & 0xFFF0) == 0xAC10);          /* 172.16-31.x.x */
 }
 
-/* Pending DISCO probe tracking */
+/* Pending DISCO probe tracking. Each destination of a ping round (best
+ * path, every endpoint, DERP) gets its own ping and txid, as in Tailscale's
+ * magicsock: a PONG's outer UDP source isn't authenticated, so it only proves
+ * a direct path when it comes back from the address that txid went to. With
+ * one txid for every destination, anyone on the path could resend a captured
+ * PONG from their own address and become the peer's direct path. */
 typedef struct {
     uint8_t txid[DISCO_TXID_LEN];
-    uint32_t dest_ip;
+    uint32_t dest_ip;      /* host byte order; 0 when sent over DERP */
     uint16_t dest_port;
     uint64_t sent_ms;
     int peer_index;
     bool active;
-    /* A ping goes out on several paths at once (best path, every endpoint,
-     * DERP), and the peer answers each copy with the same txid. The slot
-     * stays until it expires so those extra PONGs are recognised: the first
-     * one per kind (DERP / direct) counts, the rest are duplicates. */
+    /* The slot stays until it expires so a repeated PONG is recognised */
     bool answered;      /* any PONG seen */
     bool got_direct;    /* a direct PONG seen */
 } disco_probe_t;
 
-#define MAX_PENDING_PROBES 32
+/* One slot per destination now; when full, the oldest probe makes room */
+#define MAX_PENDING_PROBES 64
 static disco_probe_t pending_probes[MAX_PENDING_PROBES];
 
 /* ============================================================================
@@ -897,7 +900,10 @@ static void process_peer_updates(tailtiny_t *ml) {
  * DISCO Protocol
  * ========================================================================== */
 
+/* dest_ip/dest_port: the one address this ping goes to (host byte order),
+ * 0/0 for DERP. A direct PONG must come back from exactly there. */
 static void disco_build_ping(tailtiny_t *ml, int peer_idx,
+                               uint32_t dest_ip, uint16_t dest_port,
                                uint8_t *out, size_t *out_len) {
     ml_peer_t *p = &ml->peers[peer_idx];
 
@@ -928,26 +934,31 @@ static void disco_build_ping(tailtiny_t *ml, int peer_idx,
     memcpy(out + pos, ciphertext, sizeof(ciphertext)); pos += sizeof(ciphertext);
     *out_len = pos;
 
-    /* Track pending probe */
-    bool registered = false;
+    /* Track pending probe: a free slot, or else the oldest one */
+    int slot = -1;
     for (int i = 0; i < MAX_PENDING_PROBES; i++) {
-        if (!pending_probes[i].active) {
-            memcpy(pending_probes[i].txid, txid, DISCO_TXID_LEN);
-            pending_probes[i].peer_index = peer_idx;
-            pending_probes[i].sent_ms = ml_get_time_ms();
-            pending_probes[i].active = true;
-            pending_probes[i].answered = false;
-            pending_probes[i].got_direct = false;
-            registered = true;
-            ESP_LOGD(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
-                     i, p->hostname, txid[0], txid[1], txid[2], txid[3]);
-            break;
-        }
+        if (!pending_probes[i].active) { slot = i; break; }
+        if (slot < 0 || pending_probes[i].sent_ms < pending_probes[slot].sent_ms) slot = i;
     }
-    if (!registered) {
-        ESP_LOGW(TAG, "DISCO probe table full (%d slots), pong will be unmatched",
-                 MAX_PENDING_PROBES);
+    if (pending_probes[slot].active) {
+        ESP_LOGD(TAG, "DISCO probe table full (%d slots), reusing the oldest", MAX_PENDING_PROBES);
     }
+    memcpy(pending_probes[slot].txid, txid, DISCO_TXID_LEN);
+    pending_probes[slot].peer_index = peer_idx;
+    pending_probes[slot].dest_ip = dest_ip;
+    pending_probes[slot].dest_port = dest_port;
+    pending_probes[slot].sent_ms = ml_get_time_ms();
+    pending_probes[slot].active = true;
+    pending_probes[slot].answered = false;
+    pending_probes[slot].got_direct = false;
+    ESP_LOGD(TAG, "Probe registered slot=%d peer=%s txid=%02x%02x%02x%02x",
+             slot, p->hostname, txid[0], txid[1], txid[2], txid[3]);
+}
+
+/* May DISCO send to this endpoint (host byte order)? Not to the tailnet's own
+ * range, loopback and the like: see wireguardif_endpoint_ip4_ok(). */
+static bool disco_endpoint_ok(uint32_t ip_hbo, uint16_t port) {
+    return ip_hbo != 0 && port != 0 && wireguardif_endpoint_ip4_ok(htonl(ip_hbo));
 }
 
 static void disco_build_pong(tailtiny_t *ml, int peer_idx,
@@ -1002,16 +1013,15 @@ static void disco_send_ping_to_peer(tailtiny_t *ml, int peer_idx, bool force) {
 
     uint8_t pkt[256];
     size_t pkt_len = 0;
-    disco_build_ping(ml, peer_idx, pkt, &pkt_len);
-
-    if (pkt_len == 0) return;
-
     bool direct_sent = false;
+
+    /* Each destination gets its own ping (and txid): see disco_probe_t. */
 
     /* If we have a known working direct path, send there FIRST.
      * This is critical for heartbeat pings to renew trust_until_ms.
      * A DERP pong would arrive with via_derp=true and NOT renew trust. */
-    if (p->has_direct_path && p->best_ip != 0 && p->best_port != 0) {
+    if (p->has_direct_path && disco_endpoint_ok(p->best_ip, p->best_port)) {
+        disco_build_ping(ml, peer_idx, p->best_ip, p->best_port, pkt, &pkt_len);
         disco_udp_sendto(ml, pkt, pkt_len, p->best_ip, p->best_port);
         direct_sent = true;
     }
@@ -1020,11 +1030,12 @@ static void disco_send_ping_to_peer(tailtiny_t *ml, int peer_idx, bool force) {
     {
         bool has_udp = disco_has_udp_path(ml);
         if (has_udp) {
-            for (int i = 0; i < p->endpoint_count; i++) {
-                if (!p->endpoints[i].is_ipv6 && p->endpoints[i].ip != 0) {
+            for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+                if (!p->endpoints[i].is_ipv6 && disco_endpoint_ok(p->endpoints[i].ip, p->endpoints[i].port)) {
                     /* Skip if same as best_ip (already sent) */
                     if (p->endpoints[i].ip == p->best_ip &&
                         p->endpoints[i].port == p->best_port) continue;
+                    disco_build_ping(ml, peer_idx, p->endpoints[i].ip, p->endpoints[i].port, pkt, &pkt_len);
                     int ret = disco_udp_sendto(ml, pkt, pkt_len, p->endpoints[i].ip, p->endpoints[i].port);
                     if (!direct_sent) {  /* Log only first direct send per peer */
                         ESP_LOGI(TAG, "  direct probe -> %d.%d.%d.%d:%d (%d eps, ret=%d)",
@@ -1050,6 +1061,7 @@ static void disco_send_ping_to_peer(tailtiny_t *ml, int peer_idx, bool force) {
      * Skip DERP for heartbeat pings when direct path is active to avoid
      * DERP pong stealing the probe match from the direct pong. */
     if (!p->has_direct_path || !direct_sent) {
+        disco_build_ping(ml, peer_idx, 0, 0, pkt, &pkt_len);
         ml_derp_queue_send(ml, p->public_key, pkt, pkt_len);
         ESP_LOGD(TAG, "DISCO PING -> %s via DERP", p->hostname);
     } else {
@@ -1091,50 +1103,23 @@ static void process_disco_ping(tailtiny_t *ml, const ml_rx_packet_t *pkt,
 
     if (pong_len == 0) return;
 
-    /* Send PONG via ALL paths for maximum reachability (matching v1 + tailscaled):
-     * 1. Direct reply to PING source address (opens NAT hole)
-     * 2. All known LAN endpoints (fastest path for same-network)
-     * 3. DERP relay (guaranteed delivery) */
-
+    /* One PONG, back the way the PING came, as tailscaled does: direct to
+     * its source, or over DERP if it came over DERP (or the direct send
+     * fails). The PONG names the address the PING came from, and the peer
+     * matches it by txid to the one address it pinged, so the copies this
+     * used to send as well (to every LAN endpoint, one public endpoint and
+     * always DERP) proved nothing. They cost a DERP write and wake-up for
+     * every 3 s heartbeat, and a DERP copy that won the race kept the
+     * direct path's trust from being renewed on the peer's side. */
     bool direct_sent = false;
-
-    /* 1. Direct reply to PING source (if it was direct UDP) */
-    if (!pkt->via_derp && pkt->src_ip != 0 && pkt->src_port != 0) {
-        disco_udp_sendto(ml, pong, pong_len, pkt->src_ip, pkt->src_port);
-        direct_sent = true;
+    if (!pkt->via_derp && disco_has_udp_path(ml) && disco_endpoint_ok(pkt->src_ip, pkt->src_port)) {
+        direct_sent = disco_udp_sendto(ml, pong, pong_len, pkt->src_ip, pkt->src_port) > 0;
+    }
+    if (!direct_sent) {
+        ml_derp_queue_send(ml, p->public_key, pong, pong_len);
     }
 
-    /* 2. Send to ALL known LAN endpoints (same-network = fastest path) */
-    if (disco_has_udp_path(ml)) {
-        for (int i = 0; i < p->endpoint_count; i++) {
-            if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
-            if (!is_lan_ip(p->endpoints[i].ip)) continue;
-            /* Skip if this is the same as the ping source (already sent) */
-            if (p->endpoints[i].ip == pkt->src_ip &&
-                p->endpoints[i].port == pkt->src_port) continue;
-
-            disco_udp_sendto(ml, pong, pong_len, p->endpoints[i].ip, p->endpoints[i].port);
-            direct_sent = true;
-        }
-
-        /* 2b. Also try public endpoints if no LAN worked */
-        if (!direct_sent) {
-            for (int i = 0; i < p->endpoint_count; i++) {
-                if (p->endpoints[i].is_ipv6 || p->endpoints[i].ip == 0) continue;
-                if (is_lan_ip(p->endpoints[i].ip)) continue;
-
-                disco_udp_sendto(ml, pong, pong_len, p->endpoints[i].ip, p->endpoints[i].port);
-                direct_sent = true;
-                break;  /* Only try one public endpoint */
-            }
-        }
-    }
-
-    /* 3. ALWAYS send via DERP (guaranteed delivery, even if direct worked) */
-    ml_derp_queue_send(ml, p->public_key, pong, pong_len);
-
-    ESP_LOGD(TAG, "PONG sent to %s (direct=%s, DERP=yes)",
-             p->hostname, direct_sent ? "yes" : "no");
+    ESP_LOGD(TAG, "PONG sent to %s (%s)", p->hostname, direct_sent ? "direct" : "DERP");
 }
 
 static void process_disco_pong(tailtiny_t *ml, const ml_rx_packet_t *pkt,
@@ -1160,6 +1145,21 @@ static void process_disco_pong(tailtiny_t *ml, const ml_rx_packet_t *pkt,
         ml_peer_t *p = &ml->peers[peer_idx];
         uint64_t rtt_ms = now - pending_probes[i].sent_ms;
 
+        /* Sealed by the peer we pinged, not just any peer that knows the txid */
+        if (!p->active || memcmp(sender_disco_key, p->disco_key, 32) != 0) {
+            continue;
+        }
+        /* A direct PONG proves a path only from the address this txid went to
+         * (its outer source isn't authenticated). One that comes from anywhere
+         * else, or answers a ping we sent over DERP, is ignored. */
+        if (!pkt->via_derp &&
+            (pending_probes[i].dest_ip == 0 ||
+             pkt->src_ip != pending_probes[i].dest_ip ||
+             pkt->src_port != pending_probes[i].dest_port)) {
+            ESP_LOGD(TAG, "DISCO PONG for %s from an address we didn't ping, ignored", p->hostname);
+            continue;
+        }
+
         matched = true;
         if (pkt->via_derp ? pending_probes[i].answered : pending_probes[i].got_direct) {
             ESP_LOGD(TAG, "DISCO PONG duplicate from %s (via %s)",
@@ -1169,8 +1169,10 @@ static void process_disco_pong(tailtiny_t *ml, const ml_rx_packet_t *pkt,
         pending_probes[i].answered = true;
         if (!pkt->via_derp) pending_probes[i].got_direct = true;
 
-        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
-                 p->hostname, (unsigned long long)rtt_ms,
+        /* %lu, not %llu: newlib-nano's printf (the ESP32-C2 default) has no
+         * 64-bit formats, and the %s after it then read a bogus pointer */
+        ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%lu ms (via %s)",
+                 p->hostname, (unsigned long)rtt_ms,
                  pkt->via_derp ? "DERP" : "direct");
 
         p->last_pong_recv_ms = now;
@@ -1265,9 +1267,13 @@ static void process_disco_pong(tailtiny_t *ml, const ml_rx_packet_t *pkt,
                          * If handshake succeeds, the response handler will
                          * establish the session regardless of active flag. */
                         {
+                            /* Under the device lock: lwIP's thread sets active
+                             * too, when a packet finds no session */
                             struct wireguard_device *dev = (struct wireguard_device *)netif->state;
                             if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
+                                wireguard_platform_lock(dev->lock);
                                 dev->peers[p->wg_peer_index].active = false;
+                                wireguard_platform_unlock(dev->lock);
                             }
                         }
                         ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
@@ -1305,6 +1311,18 @@ static void process_disco_packet(tailtiny_t *ml, const ml_rx_packet_t *pkt) {
 
     /* Extract sender's disco public key */
     const uint8_t *sender_disco_key = pkt->data + 6;
+
+    /* Only a peer we know may cost us an X25519. The shared key was derived
+     * before anything checked the sender, so anyone who could reach the UDP port
+     * (or send over DERP) cost the WireGuard task 30-40 ms per packet with a new
+     * random key, and pushed real peers out of the shared-key cache. Every
+     * message type below needs a known peer anyway, as in Tailscale's magicsock
+     * ("ignoring disco-looking frame, don't know of key"). */
+    if (find_peer_by_disco_key(ml, sender_disco_key) < 0) {
+        ESP_LOGD(TAG, "DISCO from unknown key %02x%02x%02x%02x, dropped",
+                 sender_disco_key[0], sender_disco_key[1], sender_disco_key[2], sender_disco_key[3]);
+        return;
+    }
 
     /* Extract nonce */
     const uint8_t *nonce = pkt->data + 38;
@@ -1392,12 +1410,15 @@ static void process_disco_packet(tailtiny_t *ml, const ml_rx_packet_t *pkt) {
                               ((uint32_t)entry[13] << 16) |
                               ((uint32_t)entry[14] << 8) |
                               (uint32_t)entry[15];
+                /* Not an address in the tailnet's range or the like: a peer
+                 * could name one that routes back into our WireGuard netif */
+                if (!disco_endpoint_ok(ip, port)) continue;
 
                 /* Send DISCO ping to this endpoint */
                 if (disco_has_udp_path(ml)) {
                     uint8_t ping_pkt[256];
                     size_t ping_len = 0;
-                    disco_build_ping(ml, peer_idx, ping_pkt, &ping_len);
+                    disco_build_ping(ml, peer_idx, ip, port, ping_pkt, &ping_len);
 
                     if (ping_len > 0) {
                         int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);

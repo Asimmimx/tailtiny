@@ -34,3 +34,6 @@ docs/PPP_ANALYSIS.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Python bytecode from the host tests
+__pycache__/

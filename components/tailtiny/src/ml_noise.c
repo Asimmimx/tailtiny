@@ -262,8 +262,11 @@ esp_err_t ml_noise_write_msg1(ml_noise_state_t *state, uint8_t *out, size_t *out
  * Matches v1's noise_read_message_2() exactly.
  */
 esp_err_t ml_noise_read_msg2(ml_noise_state_t *state, const uint8_t *msg, size_t len) {
-    if (len < 32 + 16) {
-        ESP_LOGE(TAG, "Noise msg2 too short: %d (need >= 48)", (int)len);
+    /* Exactly 48: the IK msg2 payload is empty. do_noise_handshake() already
+     * requires that. A longer one would be decrypted below into a NULL
+     * buffer once its tag verified. */
+    if (len != 32 + 16) {
+        ESP_LOGE(TAG, "Noise msg2 is %d bytes (expected 48)", (int)len);
         return ESP_FAIL;
     }
 
@@ -330,7 +333,8 @@ esp_err_t ml_noise_decrypt(const uint8_t *key, uint64_t nonce,
                             uint8_t *plaintext) {
     if (noise_aead_decrypt(key, nonce, ad, ad_len,
                             ciphertext, ct_len, plaintext) != 0) {
-        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%llu)", (unsigned long long)nonce);
+        /* %lu, not %llu: newlib-nano's printf has no long long */
+        ESP_LOGE(TAG, "Noise decrypt failed (nonce=%lu)", (unsigned long)nonce);
         return ESP_ERR_INVALID_MAC;
     }
     return ESP_OK;
